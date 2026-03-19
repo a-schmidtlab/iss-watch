@@ -3,7 +3,6 @@
 ISS Watch — Raspberry Pi ISS Stream Controller
 Primär: Sen 4K ISS-Kamera.
 Alle 5 Minuten: kurzer Blick auf NASA ISS-Kamera (30s) falls live.
-Keine LOS Überprüfung der Sen Kamera.
 """
 
 import subprocess
@@ -11,12 +10,10 @@ import time
 import json
 import socket
 import os
-import math
 import urllib.request
 import numpy as np
 import cv2
-from datetime import datetime, timezone, timedelta
-from sgp4.api import Satrec, jday
+from datetime import datetime
 
 # ── Konfiguration ──────────────────────────────────────────────────────────────
 
@@ -30,11 +27,16 @@ NASA_CHECK_INTERVAL = 5 * 60   # Alle 5 Minuten NASA prüfen
 NASA_PEEK_DURATION  = 30       # Sekunden NASA zeigen wenn live
 VIDEO_ID_TTL        = 2 * 3600
 HLS_URL_TTL         = 90 * 60
-TLE_URL             = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE"
-TLE_TTL             = 6 * 3600
-
 # LOS-Erkennung NASA
 LOS_WHITE_THRESHOLD = 0.08
+
+# Bildschirmhelligkeit nach Uhrzeit
+BRIGHTNESS_SCHEDULE = [
+    (6,  1.0),   # 06:00 – 21:00 → volle Helligkeit
+    (21, 0.6),   # 21:00 – 01:00 → gedimmt
+    (1,  0.3),   # 01:00 – 06:00 → sehr dunkel
+]
+DISPLAY_OUTPUT = "HDMI-A-1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -231,6 +233,31 @@ def nasa_is_live(hls_url):
 
 # ── Hauptschleife ─────────────────────────────────────────────────────────────
 
+
+def get_target_brightness():
+    """Gibt die Soll-Helligkeit für die aktuelle Uhrzeit zurück."""
+    hour = datetime.now().hour
+    # Schedule von unten nach oben prüfen (letzte passende Stunde gewinnt)
+    brightness = BRIGHTNESS_SCHEDULE[0][1]
+    for start_hour, value in BRIGHTNESS_SCHEDULE:
+        if hour >= start_hour:
+            brightness = value
+    return brightness
+
+
+def set_brightness(brightness):
+    """Setzt Bildschirmhelligkeit via xrandr."""
+    try:
+        subprocess.run(
+            ["xrandr", "--output", DISPLAY_OUTPUT, "--brightness", str(brightness)],
+            env={**os.environ, "DISPLAY": ":0"},
+            capture_output=True, timeout=5
+        )
+        print(f"[brightness] {brightness}")
+    except Exception as e:
+        print(f"[brightness] Fehler: {e}")
+
+
 def main():
     print("=" * 55)
     print("  ISS Watch gestartet")
@@ -245,11 +272,18 @@ def main():
     mode = "sen"   # "sen" oder "nasa_peek"
 
     last_nasa_check = time.time() - NASA_CHECK_INTERVAL + 30
+    current_brightness = None  # Wird beim ersten Loop gesetzt
     # 30s Versatz damit der erste Check nicht sofort beim Start kommt
 
     while True:
         try:
             now = time.time()
+
+            # Helligkeit anpassen falls nötig
+            target = get_target_brightness()
+            if target != current_brightness:
+                set_brightness(target)
+                current_brightness = target
 
             # Video-ID im Cache halten
             url_cache.get_video_id()
