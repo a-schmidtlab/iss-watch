@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=ISS Watch
+Exec=systemctl --user start iss-watch
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true

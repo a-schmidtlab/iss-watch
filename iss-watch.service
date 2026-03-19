@@ -1,0 +1,15 @@
+[Unit]
+Description=ISS Watch Stream Controller
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/python3 -u /home/axel/iss/iss_watch.py
+StandardOutput=append:/home/axel/iss/iss_watch.log
+StandardError=append:/home/axel/iss/iss_watch.log
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=graphical-session.target
