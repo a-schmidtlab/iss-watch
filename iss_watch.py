@@ -237,12 +237,13 @@ def nasa_is_live(hls_url):
 def get_target_brightness():
     """Gibt die Soll-Helligkeit für die aktuelle Uhrzeit zurück."""
     hour = datetime.now().hour
-    # Schedule von unten nach oben prüfen (letzte passende Stunde gewinnt)
-    brightness = BRIGHTNESS_SCHEDULE[0][1]
-    for start_hour, value in BRIGHTNESS_SCHEDULE:
-        if hour >= start_hour:
-            brightness = value
-    return brightness
+    # Zeitfenster: 06-21 → 1.0, 21-01 → 0.6, 01-06 → 0.3
+    if 6 <= hour < 21:
+        return 1.0
+    elif 21 <= hour or hour < 1:
+        return 0.6
+    else:  # 1 <= hour < 6
+        return 0.3
 
 
 def set_brightness(brightness):
@@ -334,3 +335,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
