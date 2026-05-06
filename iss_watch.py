@@ -22,6 +22,7 @@ NASA_FALLBACK_ID = "zPH5KtjJFaQ"
 SEN_STREAM       = "https://www.youtube.com/@sen/live"
 MPV_SOCKET       = "/tmp/mpv-ipc"
 NASA_CHECK_IMG   = "/tmp/nasa_check.png"
+YT_COOKIES       = os.path.expanduser("~/projects/iss-watch/yt-cookies.txt")
 
 NASA_CHECK_INTERVAL = 5 * 60    # Alle 5 Minuten NASA prüfen
 NASA_PEEK_DURATION  = 30        # Sekunden NASA zeigen wenn live
@@ -32,6 +33,8 @@ LOS_WHITE_THRESHOLD = 0.08
 
 WATCHDOG_INTERVAL   = 30        # Sekunden zwischen Watchdog-Checks
 WATCHDOG_MAX_STUCK  = 3         # Wie oft darf playback-time gleich bleiben
+# Für einen Live-Stream: mindestens 30% Fortschritt in WATCHDOG_INTERVAL Sekunden
+STUCK_MIN_PROGRESS  = WATCHDOG_INTERVAL * 0.3   # ~9s in 30s Wanduhrzeit
 
 DISPLAY_OUTPUT = "HDMI-A-1"
 
@@ -128,17 +131,24 @@ class URLCache:
         self.hls_fetched = 0
 
 
+STARTUP_GRACE = 60  # Sekunden nach Start ohne Watchdog-Eingriff
+
+
 class MPVController:
     def __init__(self, socket_path):
         self.socket_path  = socket_path
         self.proc         = None
         self._last_pos    = None
         self._stuck_count = 0
+        self._started_at  = 0
 
     def start(self, url):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             time.sleep(2)
+        # Hängende mpv-Instanzen aufräumen
+        subprocess.run(["pkill", "-x", "mpv"], capture_output=True)
+        time.sleep(1)
         if os.path.exists(self.socket_path):
             os.remove(self.socket_path)
 
@@ -148,10 +158,17 @@ class MPVController:
             "--fullscreen",
             "--no-terminal",
             "--no-osc",
+            "--idle=yes",           # Prozess läuft weiter wenn Stream endet → kein Desktop sichtbar
+            "--keep-open=no",       # Bei Stream-Ende sofort idle statt letzten Frame einfrieren
             "--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+            "--cache=yes",
+            "--demuxer-max-bytes=150MiB",
             "--really-quiet",
-            url,
         ]
+        if os.path.exists(YT_COOKIES):
+            cmd.append(f"--ytdl-raw-options=cookies={YT_COOKIES}")
+        cmd.append(url)
+
         env = os.environ.copy()
         env["DISPLAY"] = ":0"
         self.proc = subprocess.Popen(cmd, env=env,
@@ -159,6 +176,7 @@ class MPVController:
                                      stderr=subprocess.DEVNULL)
         self._last_pos    = None
         self._stuck_count = 0
+        self._started_at  = time.time()
         for _ in range(20):
             time.sleep(0.5)
             if os.path.exists(self.socket_path):
@@ -180,6 +198,7 @@ class MPVController:
     def load(self, url):
         self._last_pos    = None
         self._stuck_count = 0
+        self._started_at  = time.time()
         self.send(["loadfile", url, "replace"])
         print(f"[mpv] Lade: {url[:70]}...")
 
@@ -193,7 +212,13 @@ class MPVController:
         """
         Watchdog: prüft ob mpv tatsächlich noch Video abspielt.
         Gibt False zurück wenn IPC nicht erreichbar oder Bild eingefroren.
+        Ignoriert die ersten STARTUP_GRACE Sekunden nach dem Start.
         """
+        grace_remaining = STARTUP_GRACE - (time.time() - self._started_at)
+        if grace_remaining > 0:
+            print(f"[watchdog] Schonfrist ({grace_remaining:.0f}s verbleibend)")
+            return True
+
         result = self.send(["get_property", "playback-time"])
         if result is None or result.get("error") == "property unavailable":
             print("[watchdog] IPC nicht erreichbar")
@@ -201,12 +226,13 @@ class MPVController:
 
         pos = result.get("data")
         if pos is None:
-            print("[watchdog] Keine Abspielposition")
+            print("[watchdog] Keine Abspielposition (mpv idle)")
             return False
 
-        if self._last_pos is not None and abs(pos - self._last_pos) < 0.5:
+        if self._last_pos is not None and abs(pos - self._last_pos) < STUCK_MIN_PROGRESS:
             self._stuck_count += 1
-            print(f"[watchdog] Bild eingefroren ({self._stuck_count}/{WATCHDOG_MAX_STUCK})")
+            print(f"[watchdog] Bild eingefroren ({self._stuck_count}/{WATCHDOG_MAX_STUCK}) "
+                  f"Δ={abs(pos - self._last_pos):.1f}s")
             if self._stuck_count >= WATCHDOG_MAX_STUCK:
                 return False
         else:
@@ -284,11 +310,27 @@ def set_brightness(brightness):
         subprocess.run(
             ["xrandr", "--output", DISPLAY_OUTPUT, "--brightness", str(brightness)],
             env={**os.environ, "DISPLAY": ":0"},
-            capture_output=True, timeout=5
+            capture_output=True, timeout=10
         )
         print(f"[brightness] {brightness}")
     except Exception as e:
         print(f"[brightness] Fehler: {e}")
+
+
+def suppress_desktop_dialogs():
+    """
+    Unterdrückt WLAN-Passwort-Dialoge und andere Popups, die auf dem Kiosk-
+    Bildschirm erscheinen könnten. Setzt außerdem den Desktop-Hintergrund auf
+    Schwarz, damit bei mpv-Neustarts kein Wallpaper/Desktop durchscheint.
+    """
+    env = {**os.environ, "DISPLAY": ":0"}
+    # Desktop-Hintergrund schwarz → kein Flackern beim mpv-Neustart
+    subprocess.run(["xsetroot", "-solid", "black"], env=env, capture_output=True)
+    # MATE polkit-Auth-Agent töten: verhindert WLAN-Passwort-Popups
+    # (dauerhafter Fix: sudo nmcli connection modify ULAM connection.autoconnect no)
+    subprocess.run(["pkill", "-f", "polkit-mate-authentication-agent"],
+                   capture_output=True)
+    subprocess.run(["pkill", "-f", "nm-applet"], capture_output=True)
 
 
 def main():
@@ -297,6 +339,7 @@ def main():
     print("  Primär: Sen 4K | NASA-Check alle 5 Min")
     print("=" * 55)
 
+    suppress_desktop_dialogs()
     wait_for_network()
 
     mpv       = MPVController(MPV_SOCKET)
@@ -326,7 +369,7 @@ def main():
             if now - last_watchdog >= WATCHDOG_INTERVAL:
                 last_watchdog = now
                 if not mpv.is_running():
-                    print("[watchdog] mpv Prozess tot → Neustart")
+                    print("[watchdog] mpv Prozess tot → Vollneustart")
                     wait_for_network(30)
                     url = SEN_STREAM if mode == "sen" else url_cache.get_watch_url()
                     mpv.start(url)
@@ -334,10 +377,12 @@ def main():
                     continue
 
                 if not mpv.is_playing():
-                    print("[watchdog] mpv spielt nicht mehr → Neustart")
+                    print("[watchdog] mpv spielt nicht mehr → Stream neu laden")
                     wait_for_network(30)
                     url = SEN_STREAM if mode == "sen" else url_cache.get_watch_url()
-                    mpv.start(url)
+                    # Prozess läuft noch (--idle): loadfile statt kill+restart
+                    # → kein Desktop-Flackern während Neustart
+                    mpv.load(url)
                     time.sleep(5)
                     continue
 
