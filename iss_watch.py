@@ -10,6 +10,7 @@ import time
 import json
 import socket
 import os
+import shutil
 import logging
 import logging.handlers
 import urllib.request
@@ -38,10 +39,17 @@ WEATHER_NIGHT_URL = (
 WEATHER_REFRESH   = 15 * 60    # Neues Satellitenbild alle 15 Minuten
 
 # SEN-Modus-Erkennung via Badge-Farbe oben links im Video-Frame
-SEN_SCREENSHOT     = "/tmp/sen_frame.png"
-SEN_MODE_INTERVAL  = 30        # Alle 30s Badge prüfen (im SEN-Modus)
-SEN_FALLBACK_RETRY = 5 * 60    # Alle 5 Min auf SEN testen (im Wetter-Modus)
-SEN_UNKNOWN_LIMIT  = 6         # N unbekannte Badge-Ergebnisse → Wechsel zu Wetter
+SEN_SCREENSHOT      = "/tmp/sen_frame.png"
+SEN_PREV_SCREENSHOT = "/tmp/sen_frame_prev.png"   # Vorheriger Frame für Vergleich
+SEN_MODE_INTERVAL   = 30        # Alle 30s Badge prüfen (im SEN-Modus)
+SEN_FALLBACK_RETRY  = 5 * 60    # Alle 5 Min auf SEN testen (im Wetter-Modus)
+SEN_UNKNOWN_LIMIT   = 6         # N unbekannte Badge-Ergebnisse → Wechsel zu Wetter
+
+# Eingefrorenes Bild erkennen
+SCREENSHOT_FAIL_LIMIT = 10      # N fehlgeschlagene Screenshots in Folge → Neu laden
+FROZEN_DIFF_THRESHOLD = 1.5     # Mittlere Pixeldifferenz unter der ein Frame als
+                                 # eingefroren gilt (0–255; Live-Stream: typ. >5)
+FROZEN_FRAME_LIMIT    = 4       # N identische Frames in Folge → Neu laden
 
 # Watchdog
 WATCHDOG_INTERVAL   = 30
@@ -305,6 +313,25 @@ def wait_for_network(timeout=60):
     return False
 
 
+def is_frame_frozen(new_path, prev_path):
+    """
+    Vergleicht zwei aufeinanderfolgende Screenshots pixelweise.
+    Gibt True zurück wenn die mittlere Differenz unter FROZEN_DIFF_THRESHOLD liegt
+    (= Bild ist eingefroren).
+    """
+    if not os.path.exists(prev_path):
+        return False
+    img_new  = cv2.imread(new_path)
+    img_prev = cv2.imread(prev_path)
+    if img_new is None or img_prev is None:
+        return False
+    if img_new.shape != img_prev.shape:
+        return False
+    diff = float(cv2.absdiff(img_new, img_prev).mean())
+    log_event("frozen-chk", f"Frame-Differenz: {diff:.2f} (Schwelle: {FROZEN_DIFF_THRESHOLD})")
+    return diff < FROZEN_DIFF_THRESHOLD
+
+
 def detect_sen_mode(img_path):
     """
     Erkennt SEN-Sendemodus anhand der Badge-Farbe oben links im Video-Frame.
@@ -458,6 +485,8 @@ def main():
     last_heartbeat     = time.time()
     current_brightness = None
     sen_unknown_count  = 0
+    screenshot_fails   = 0    # Zähler: aufeinanderfolgende Screenshot-Fehler
+    frozen_count       = 0    # Zähler: aufeinanderfolgende eingefrorene Frames
 
     while True:
         try:
@@ -511,6 +540,31 @@ def main():
             if mode == "sen" and now - last_sen_mode_chk >= SEN_MODE_INTERVAL:
                 last_sen_mode_chk = now
                 if mpv.screenshot(SEN_SCREENSHOT):
+                    screenshot_fails = 0
+
+                    # ── Eingefrorenes Bild erkennen ──────────────────────────
+                    if is_frame_frozen(SEN_SCREENSHOT, SEN_PREV_SCREENSHOT):
+                        frozen_count += 1
+                        log_warn("frozen",
+                                 f"Frame eingefroren ({frozen_count}/{FROZEN_FRAME_LIMIT})")
+                        if frozen_count >= FROZEN_FRAME_LIMIT:
+                            log_warn("frozen",
+                                     "Stream dauerhaft eingefroren → Neu laden")
+                            frozen_count = 0
+                            sen_unknown_count = 0
+                            set_display_state("sen_loading", "Watchdog: eingefrorener Frame")
+                            wait_for_network(30)
+                            mpv.load(SEN_STREAM)
+                            time.sleep(5)
+                    else:
+                        frozen_count = 0
+                        # Aktuellen Frame als Referenz für nächsten Vergleich speichern
+                        try:
+                            shutil.copy2(SEN_SCREENSHOT, SEN_PREV_SCREENSHOT)
+                        except Exception:
+                            pass
+
+                    # ── Badge-Farbe auswerten ────────────────────────────────
                     sen_mode = detect_sen_mode(SEN_SCREENSHOT)
                     log_event("sen-modus", f"Badge erkannt: {sen_mode}")
 
@@ -518,6 +572,7 @@ def main():
                         log_warn("sen-modus",
                                  f"SEN ist nicht live ({sen_mode}) → Wechsel zu Wetter")
                         sen_unknown_count = 0
+                        frozen_count      = 0
                         last_weather_dl    = load_weather(mpv, now)
                         last_weather_retry = now
                         set_display_state("weather", f"SEN-Badge: {sen_mode}")
@@ -531,6 +586,7 @@ def main():
                             log_warn("sen-modus",
                                      "Badge dauerhaft unlesbar → Wechsel zu Wetter")
                             sen_unknown_count = 0
+                            frozen_count      = 0
                             last_weather_dl    = load_weather(mpv, now)
                             last_weather_retry = now
                             set_display_state("weather", "SEN-Badge unlesbar")
@@ -542,7 +598,20 @@ def main():
                         sen_unknown_count = 0
 
                 else:
-                    log_warn("sen-modus", "Screenshot fehlgeschlagen — überspringe")
+                    screenshot_fails += 1
+                    log_warn("sen-modus",
+                             f"Screenshot fehlgeschlagen "
+                             f"({screenshot_fails}/{SCREENSHOT_FAIL_LIMIT})")
+                    if screenshot_fails >= SCREENSHOT_FAIL_LIMIT:
+                        log_warn("sen-modus",
+                                 "Dauerhaft kein Screenshot möglich → Stream neu laden")
+                        screenshot_fails  = 0
+                        frozen_count      = 0
+                        sen_unknown_count = 0
+                        set_display_state("sen_loading", "Watchdog: kein Screenshot")
+                        wait_for_network(30)
+                        mpv.load(SEN_STREAM)
+                        time.sleep(5)
 
             # ── Im Wetter-Modus ──────────────────────────────────────────────
             if mode == "weather":
