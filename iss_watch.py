@@ -10,6 +10,7 @@ import time
 import json
 import socket
 import os
+import re
 import shutil
 import logging
 import logging.handlers
@@ -17,6 +18,12 @@ import urllib.request
 import numpy as np
 import cv2
 from datetime import datetime
+
+try:
+    import pytesseract
+    _TESSERACT_OK = True
+except ImportError:
+    _TESSERACT_OK = False
 
 # ── Konfiguration ──────────────────────────────────────────────────────────────
 
@@ -51,6 +58,11 @@ FROZEN_DIFF_THRESHOLD = 1.5     # Mittlere Pixeldifferenz unter der ein Frame al
                                  # eingefroren gilt (0–255; Live-Stream: typ. >5)
 FROZEN_FRAME_LIMIT    = 4       # N identische Frames in Folge → Neu laden
 
+# Timer-basiertes vorausschauendes Umschalten (OCR des Telemetrie-Balkens)
+# Funktioniert nur wenn pytesseract + tesseract installiert sind.
+SEN_PREEMPTIVE_SWITCH = 60   # Sekunden vor Signal Loss vorbeugend auf Wetter wechseln
+SEN_PRELOAD_BEFORE    = 90   # Sekunden vor erwartetem Signal SEN vorladen
+
 # Watchdog
 WATCHDOG_INTERVAL   = 30
 WATCHDOG_MAX_STUCK  = 3
@@ -76,6 +88,18 @@ def _fmt_dur(seconds):
     if s < 3600:
         return f"{s // 60}m{s % 60:02d}s"
     return f"{s // 3600}h{(s % 3600) // 60:02d}m{s % 60:02d}s"
+
+
+def _fmt_hms(seconds):
+    """Sekunden → HH:MM:SS, z.B. '00:14:45'."""
+    s = max(0, int(seconds))
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def _parse_hms(t):
+    """'HH:MM:SS' → Sekunden als int."""
+    p = t.split(":")
+    return int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
 
 
 def _is_local_file(url):
@@ -223,10 +247,10 @@ class MPVController:
                 break
         log_event("mpv", f"Neustart #{self._restarts}: {url[:70]}")
 
-    def send(self, command):
+    def send(self, command, timeout=5):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(3)
+                s.settimeout(timeout)
                 s.connect(self.socket_path)
                 msg = json.dumps({"command": command}) + "\n"
                 s.sendall(msg.encode())
@@ -246,7 +270,8 @@ class MPVController:
 
     def screenshot(self, path):
         """Aktuellen Video-Frame als PNG speichern."""
-        result = self.send(["screenshot-to-file", path, "video"])
+        # h264-Dekodierung + PNG-Kompression kann auf dem Pi 10+ s dauern
+        result = self.send(["screenshot-to-file", path, "video"], timeout=20)
         if result and result.get("error") == "success":
             time.sleep(0.3)
             return os.path.exists(path)
@@ -311,6 +336,68 @@ def wait_for_network(timeout=60):
             time.sleep(3)
     log_warn("netzwerk", f"Kein Netzwerk nach {timeout}s — fahre trotzdem fort")
     return False
+
+
+def read_sen_timers(img_path):
+    """
+    Liest SIGNAL LOSS und EXPECTED SIGNAL Countdown-Timer aus dem
+    SEN-Telemetrie-Balken (untere ~17% des Frames) per OCR.
+
+    Telemetrie-Balken-Layout (rechter Bereich):
+      TIME UTC | SUNSET | SIGNAL LOSS (oder EXPECTED SIGNAL) | SPEED/ALTITUDE
+      Jedes Feld: Label oben, Wert (HH:MM:SS) darunter.
+
+    Gibt zurück:
+      {"loss": <sek>}     wenn SIGNAL LOSS Countdown erkannt
+      {"signal": <sek>}   wenn EXPECTED SIGNAL Countdown erkannt
+      {}                  wenn OCR nicht verfügbar oder Feld nicht gefunden
+    """
+    if not _TESSERACT_OK:
+        return {}
+    img = cv2.imread(img_path)
+    if img is None:
+        return {}
+
+    h, w = img.shape[:2]
+    # Telemetrie-Balken: untere ~17%, mittlerer Bereich (überspringt
+    # linken Scroll-Text und rechten Dezimalwert bei Speed/Altitude)
+    bar = img[int(h * 0.83):h, int(w * 0.35):int(w * 0.85)]
+
+    gray   = cv2.cvtColor(bar, cv2.COLOR_BGR2GRAY)
+    scaled = cv2.resize(gray, (gray.shape[1] * 2, gray.shape[0] * 2),
+                        interpolation=cv2.INTER_LANCZOS4)
+    _, thresh = cv2.threshold(scaled, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    text = pytesseract.image_to_string(
+        thresh,
+        config=(
+            "--psm 6 "
+            "-c tessedit_char_whitelist="
+            "0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+        ),
+    ).upper()
+
+    result = {}
+
+    # "SIGNAL LOSS 00:14:45" — OCR-Artefakte: L0SS, SIGNALLOSS, etc.
+    m = re.search(r'SIGNAL\s*L[O0]?SS\s+(\d{2}:\d{2}:\d{2})', text)
+    if m:
+        result["loss"] = _parse_hms(m.group(1))
+
+    # "EXPECTED SIGNAL 00:17:41"
+    m = re.search(r'EXPECTED\s+SIGNAL\s+(\d{2}:\d{2}:\d{2})', text)
+    if not m:
+        m = re.search(r'EXPECTED\s+(\d{2}:\d{2}:\d{2})', text)
+    if m:
+        result["signal"] = _parse_hms(m.group(1))
+
+    if result:
+        parts = [f"loss={_fmt_hms(result['loss'])}" if "loss" in result else "",
+                 f"signal={_fmt_hms(result['signal'])}" if "signal" in result else ""]
+        log_event("sen-timer", "OCR: " + " | ".join(p for p in parts if p))
+
+    return result
 
 
 def is_frame_frozen(new_path, prev_path):
@@ -484,9 +571,10 @@ def main():
     last_weather_dl    = 0
     last_heartbeat     = time.time()
     current_brightness = None
-    sen_unknown_count  = 0
-    screenshot_fails   = 0    # Zähler: aufeinanderfolgende Screenshot-Fehler
-    frozen_count       = 0    # Zähler: aufeinanderfolgende eingefrorene Frames
+    sen_unknown_count       = 0
+    screenshot_fails        = 0    # Zähler: aufeinanderfolgende Screenshot-Fehler
+    frozen_count            = 0    # Zähler: aufeinanderfolgende eingefrorene Frames
+    sen_expected_signal_at  = 0    # Timestamp wann SEN-Signal erwartet (0 = unbekannt)
 
     while True:
         try:
@@ -564,38 +652,64 @@ def main():
                         except Exception:
                             pass
 
-                    # ── Badge-Farbe auswerten ────────────────────────────────
-                    sen_mode = detect_sen_mode(SEN_SCREENSHOT)
-                    log_event("sen-modus", f"Badge erkannt: {sen_mode}")
+                    # ── Timer aus Telemetrie-Balken lesen ───────────────────
+                    timers = read_sen_timers(SEN_SCREENSHOT)
 
-                    if sen_mode in ("replay", "trailer"):
-                        log_warn("sen-modus",
-                                 f"SEN ist nicht live ({sen_mode}) → Wechsel zu Wetter")
+                    # ── Vorbeugender Wechsel bei baldiger Signalunterbrechung ─
+                    if "loss" in timers and timers["loss"] <= SEN_PREEMPTIVE_SWITCH:
+                        log_warn("sen-timer",
+                                 f"Signal Loss in {_fmt_hms(timers['loss'])} "
+                                 f"→ jetzt auf Wetter wechseln")
                         sen_unknown_count = 0
                         frozen_count      = 0
+                        sen_expected_signal_at = 0  # wird beim ersten Retry ermittelt
                         last_weather_dl    = load_weather(mpv, now)
                         last_weather_retry = now
-                        set_display_state("weather", f"SEN-Badge: {sen_mode}")
+                        set_display_state("weather",
+                                          f"Signal Loss in {_fmt_hms(timers['loss'])}")
                         mode = "weather"
 
-                    elif sen_mode == "unknown":
-                        sen_unknown_count += 1
-                        log_warn("sen-modus",
-                                 f"Badge unbekannt ({sen_unknown_count}/{SEN_UNKNOWN_LIMIT})")
-                        if sen_unknown_count >= SEN_UNKNOWN_LIMIT:
+                    else:
+                        # ── Badge-Farbe auswerten ────────────────────────────
+                        sen_mode = detect_sen_mode(SEN_SCREENSHOT)
+                        log_event("sen-modus", f"Badge erkannt: {sen_mode}")
+
+                        if sen_mode in ("replay", "trailer"):
                             log_warn("sen-modus",
-                                     "Badge dauerhaft unlesbar → Wechsel zu Wetter")
+                                     f"SEN ist nicht live ({sen_mode}) → Wechsel zu Wetter")
                             sen_unknown_count = 0
                             frozen_count      = 0
+                            # EXPECTED SIGNAL aus dem Replay-Frame lesen
+                            if "signal" in timers and timers["signal"] > 0:
+                                sen_expected_signal_at = now + timers["signal"]
+                                log_event("sen-timer",
+                                          f"Signal erwartet um "
+                                          f"{datetime.fromtimestamp(sen_expected_signal_at).strftime('%H:%M:%S')}"
+                                          f" (in {_fmt_hms(timers['signal'])})")
                             last_weather_dl    = load_weather(mpv, now)
                             last_weather_retry = now
-                            set_display_state("weather", "SEN-Badge unlesbar")
+                            set_display_state("weather", f"SEN-Badge: {sen_mode}")
                             mode = "weather"
 
-                    else:  # "live"
-                        if _display_state != "sen_live":
-                            set_display_state("sen_live", "Badge: live")
-                        sen_unknown_count = 0
+                        elif sen_mode == "unknown":
+                            sen_unknown_count += 1
+                            log_warn("sen-modus",
+                                     f"Badge unbekannt ({sen_unknown_count}/{SEN_UNKNOWN_LIMIT})")
+                            if sen_unknown_count >= SEN_UNKNOWN_LIMIT:
+                                log_warn("sen-modus",
+                                         "Badge dauerhaft unlesbar → Wechsel zu Wetter")
+                                sen_unknown_count = 0
+                                frozen_count      = 0
+                                last_weather_dl    = load_weather(mpv, now)
+                                last_weather_retry = now
+                                set_display_state("weather", "SEN-Badge unlesbar")
+                                mode = "weather"
+
+                        else:  # "live"
+                            if _display_state != "sen_live":
+                                set_display_state("sen_live", "Badge: live")
+                            sen_unknown_count      = 0
+                            sen_expected_signal_at = 0  # zurücksetzen
 
                 else:
                     screenshot_fails += 1
@@ -624,30 +738,66 @@ def main():
                     if last_weather_dl > old_ts:
                         set_display_state("weather", "Satellitenbild aktualisiert")
 
-                # Regelmäßig testen ob SEN wieder live ist
-                if now - last_weather_retry >= SEN_FALLBACK_RETRY:
+                # ── Retry-Zeitpunkt bestimmen ────────────────────────────────
+                # Mit bekanntem Signal-Zeitpunkt: SEN_PRELOAD_BEFORE Sekunden davor.
+                # Ohne: festes SEN_FALLBACK_RETRY Intervall.
+                if sen_expected_signal_at > 0:
+                    retry_due = sen_expected_signal_at - SEN_PRELOAD_BEFORE
+                    if now < retry_due:
+                        remaining = retry_due - now
+                        # Alle 5 Minuten im Log anzeigen damit man sieht dass der
+                        # Timer läuft (nicht als dauerhaftes Event, nur zur Info)
+                        if now - last_weather_retry >= 5 * 60:
+                            last_weather_retry = now
+                            log_event("sen-timer",
+                                      f"Signal erwartet um "
+                                      f"{datetime.fromtimestamp(sen_expected_signal_at).strftime('%H:%M:%S')}"
+                                      f" — Vorladen in {_fmt_dur(remaining)}")
+                else:
+                    retry_due = last_weather_retry + SEN_FALLBACK_RETRY
+
+                # ── SEN-Rückkehr testen ──────────────────────────────────────
+                if now >= retry_due:
                     last_weather_retry = now
-                    log_event("sen-retry", "Teste ob SEN wieder live ist...")
-                    set_display_state("sen_retry", "alle 5 Minuten")
+                    reason = (
+                        f"Signal erwartet um "
+                        f"{datetime.fromtimestamp(sen_expected_signal_at).strftime('%H:%M:%S')}"
+                        if sen_expected_signal_at > 0 else "alle 5 Minuten"
+                    )
+                    log_event("sen-retry", f"Teste ob SEN wieder live ist ({reason})...")
+                    set_display_state("sen_retry", reason)
                     mpv.show_text("Prüfe ISS-Stream...", 4000)
                     mpv.load(SEN_STREAM)
                     time.sleep(30)  # Warten bis Stream lädt und Frame verfügbar
 
                     if mpv.screenshot(SEN_SCREENSHOT):
                         sen_mode = detect_sen_mode(SEN_SCREENSHOT)
-                        log_event("sen-retry", f"Badge beim Retry: {sen_mode}")
+                        timers   = read_sen_timers(SEN_SCREENSHOT)
+                        log_event("sen-retry", f"Badge: {sen_mode}")
+
                         if sen_mode == "live":
                             log_event("sen-retry", "SEN ist wieder live → Wechsel")
                             mode = "sen"
-                            sen_unknown_count = 0
-                            last_sen_mode_chk = now
+                            sen_unknown_count      = 0
+                            sen_expected_signal_at = 0
+                            last_sen_mode_chk      = now
                             set_display_state("sen_live", "SEN-Retry erfolgreich")
                         else:
+                            # Timer für nächsten Retry aktualisieren
+                            if "signal" in timers and timers["signal"] > 0:
+                                sen_expected_signal_at = now + timers["signal"]
+                                log_event("sen-timer",
+                                          f"Signal erwartet um "
+                                          f"{datetime.fromtimestamp(sen_expected_signal_at).strftime('%H:%M:%S')}"
+                                          f" (in {_fmt_hms(timers['signal'])})")
+                            else:
+                                sen_expected_signal_at = 0
                             log_event("sen-retry",
                                       f"SEN noch nicht live ({sen_mode}) → zurück zu Wetter")
                             last_weather_dl = load_weather(mpv, now)
                             set_display_state("weather", f"SEN-Retry: {sen_mode}")
                     else:
+                        sen_expected_signal_at = 0
                         log_warn("sen-retry",
                                  "Kein Screenshot beim Retry → zurück zu Wetter")
                         last_weather_dl = load_weather(mpv, now)
