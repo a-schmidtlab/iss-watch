@@ -451,9 +451,12 @@ def detect_sen_mode(img_path):
     b, g, r = (float(c) for c in badge[bright].mean(axis=0))
     log_event("sen-badge", f"Farbe BGR: B={b:.0f} G={g:.0f} R={r:.0f}")
 
-    if r > 150 and r - g > 60 and r - b > 60:          # Rot → Live
+    # Live-Badge ist satt rot: G ist sehr niedrig (~30), r-g ≈ 170
+    # Replay-Badge ist orange: G ist mittel (~100-140), r-g ≈ 100
+    # Schwelle 110 trennt beides sauber.
+    if r > 150 and r - g > 110 and r - b > 80:         # Rot → Live
         return "live"
-    if r > 150 and g > 50 and b < 80 and r - b > 100:  # Orange → Replay
+    if r > 150 and g > 60 and b < 100 and r - b > 80:  # Orange → Replay
         return "replay"
     if b > 100 and g > 100 and b - r > 60:             # Türkis → Trailer
         return "trailer"
