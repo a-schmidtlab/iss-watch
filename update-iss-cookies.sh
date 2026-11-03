@@ -2,7 +2,7 @@
 # update-iss-cookies.sh
 #
 # Exportiert YouTube-Cookies aus dem lokal eingeloggten Firefox und
-# deployed sie auf den ISS-Watch Pi. Läuft wöchentlich per Cron.
+# deployed sie auf den wetterraspi5 (ISS-Watch). Läuft wöchentlich per Cron.
 #
 # Voraussetzung: Firefox muss ein gültiges YouTube-Login enthalten.
 # Cron-Eintrag (crontab -e):
@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-PI_HOST="axel@192.168.178.56"
+PI_HOST="axel@192.168.178.106"   # wetterraspi5 (vorher iss-Pi .56)
 PI_KEY="$HOME/.ssh/id_ed25519"
 PI_COOKIE_PATH="~/projects/iss-watch/yt-cookies.txt"
 LOG="$HOME/.local/share/iss-watch-cookies.log"

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=ISS Watch
-Exec=systemctl --user start iss-watch
+Exec=sh -c "systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP; systemctl --user start iss-watch"
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true

@@ -1,0 +1,33 @@
+# ISS Watch – Konfiguration: ~/.config/iss-watch/config.toml
+# Alle Werte sind optional. Ohne Datei verhält sich ISS Watch wie auf dem alten
+# iss-Pi (nur ISS-Stream, X11, WLAN aus).
+
+# --- wetterraspi5 (Raspberry Pi 5, Wayland/labwc) ---
+
+# Wetter-Dashboard aus dem Repo wetterstation (Dienst wetter-web)
+dashboard_url = "http://127.0.0.1:8080/kiosk.html"
+start_view = "weather"            # iss | weather | off – nach jedem Start
+
+# Automatischer Wechsel (solange kein „Aus“ gewählt ist)
+auto_cycle = true
+cycle = [["iss", 60], ["weather", 30]]
+
+# Taster an GPIO17 (Pin 11) gegen GND (Pin 9): ISS → Wetter → Aus → ISS
+button_gpio = 17
+
+# WLAN ist hier die Reserve neben LAN und bleibt an
+disable_wifi = false
+
+# Bildschirm: um 180° gedreht (kanshi), muss beim Einschalten erhalten bleiben
+display_backend = "auto"          # auto | vcgencmd | wlr-randr
+output = "HDMI-A-1"
+output_transform = "180"
+
+# Nachtmodus
+sleep_start = 1
+sleep_end = 6
+
+# Stream
+stream_url = "https://www.youtube.com/@sen/live"
+ytdl_path = "~/.local/share/iss-watch/venv/bin/yt-dlp"
+cookies = "~/projects/iss-watch/yt-cookies.txt"

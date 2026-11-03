@@ -19,3 +19,7 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Laufzeit
+iss-watch.log*
+.pytest_cache/

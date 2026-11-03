@@ -1,13 +1,15 @@
 [Unit]
-Description=ISS Watch Stream Controller
+Description=ISS Watch Kiosk (ISS-Stream, Wetter-Dashboard)
 After=graphical-session.target network-online.target
 Wants=network-online.target
 
 [Service]
-Environment=DISPLAY=:0
-ExecStart=/usr/bin/python3 -u /home/axel/iss/iss_watch.py
+# Wayland: WAYLAND_DISPLAY importiert der Autostart-Eintrag (iss-watch.desktop)
+ExecStart=/usr/bin/python3 -u %h/iss/iss_watch.py
 Restart=always
 RestartSec=15
+# Logger und Exporter des wetterraspi5 haben Vorrang vor Stream und Browser
+Nice=10
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

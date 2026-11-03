@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 ISS Watch — Raspberry Pi ISS Stream Controller
-Zeigt dauerhaft den SEN 4K ISS-Live-Stream.
-Bildschirm aus: 01:00–06:00 via vcgencmd display_power.
+Zeigt den SEN 4K ISS-Live-Stream und optional ein Wetter-Dashboard
+(Ansichten ISS / Wetter / Aus, siehe kiosk.py und config.example.toml).
+Bildschirm aus: 01:00–06:00 (vcgencmd unter X11, wlr-randr unter Wayland).
 """
 import subprocess
 import sys
@@ -13,19 +14,19 @@ import os
 import shutil
 import logging
 import logging.handlers
+import queue
 import urllib.request
 import cv2
-from datetime import datetime
+
+import kiosk
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 
-SEN_STREAM = "https://www.youtube.com/@sen/live"
+# Stream, Cookies, Nachtmodus, Ansichten: ~/.config/iss-watch/config.toml (kiosk.py)
+CFG        = kiosk.load_config()
+SEN_STREAM = CFG.stream_url
 MPV_SOCKET = "/tmp/mpv-ipc"
-YT_COOKIES = os.path.expanduser("~/projects/iss-watch/yt-cookies.txt")
-
-# Nachtmodus: Bildschirm aus zwischen SLEEP_START und SLEEP_END Uhr
-SLEEP_START = 1   # 01:00
-SLEEP_END   = 6   # 06:00
+YT_COOKIES = CFG.cookies
 
 # Watchdog
 WATCHDOG_INTERVAL  = 30    # Sekunden zwischen Watchdog-Checks
@@ -96,20 +97,20 @@ def log_error(cat: str, msg: str) -> None:
 
 # ── Bildschirmsteuerung (Raspberry Pi) ────────────────────────────────────────
 
-def screen_on() -> None:
-    subprocess.run(["vcgencmd", "display_power", "1"], capture_output=True)
-    log_event("screen", "Bildschirm AN")
+class Display:
+    """Bildschirm an/aus mit Log, je nach Plattform vcgencmd oder wlr-randr."""
 
+    def __init__(self, cfg: kiosk.Config) -> None:
+        self.impl = (kiosk.WlrRandrDisplay(cfg.output, cfg.output_transform) if cfg.wayland
+                     else kiosk.VcgencmdDisplay())
 
-def screen_off() -> None:
-    subprocess.run(["vcgencmd", "display_power", "0"], capture_output=True)
-    log_event("screen", "Bildschirm AUS")
+    def on(self) -> None:
+        self.impl.on()
+        log_event("screen", "Bildschirm AN")
 
-
-def is_sleep_time() -> bool:
-    """True zwischen SLEEP_START und SLEEP_END Uhr."""
-    h = datetime.now().hour
-    return SLEEP_START <= h < SLEEP_END
+    def off(self) -> None:
+        self.impl.off()
+        log_event("screen", "Bildschirm AUS")
 
 
 # ── MPV-Controller ────────────────────────────────────────────────────────────
@@ -141,16 +142,21 @@ class MPVController:
             "--no-osc",
             "--idle=yes",
             "--keep-open=no",
+            "--mute=yes",
             "--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]",
             "--cache=yes",
             "--demuxer-max-bytes=150MiB",
             "--really-quiet",
         ]
+        if CFG.wayland:
+            cmd.append("--wayland-app-id=iss-mpv")
+        if CFG.ytdl_path:
+            cmd.append(f"--script-opts=ytdl_hook-ytdl_path={os.path.expanduser(CFG.ytdl_path)}")
         if os.path.exists(YT_COOKIES):
             cmd.append(f"--ytdl-raw-options=cookies={YT_COOKIES}")
         cmd.append(SEN_STREAM)
 
-        env = {**os.environ, "DISPLAY": ":0"}
+        env = dict(os.environ) if CFG.wayland else {**os.environ, "DISPLAY": ":0"}
         self.proc = subprocess.Popen(
             cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
@@ -261,16 +267,33 @@ def wait_for_network(timeout: int = 120) -> bool:
 
 
 def suppress_dialogs() -> None:
-    """Setzt Desktop auf schwarz, deaktiviert WLAN, tötet störende Dialoge."""
-    env = {**os.environ, "DISPLAY": ":0"}
-    subprocess.run(["xsetroot", "-solid", "black"], env=env, capture_output=True)
-    subprocess.run(["nmcli", "radio", "wifi", "off"], capture_output=True)
-    subprocess.run(["rfkill", "block", "wifi"], capture_output=True)
-    subprocess.run(
-        ["pkill", "-f", "polkit-mate-authentication-agent"], capture_output=True
-    )
-    subprocess.run(["pkill", "-f", "nm-applet"], capture_output=True)
-    log_event("init", "Desktop bereinigt, WLAN deaktiviert")
+    """Desktop schwarz (X11), WLAN optional aus, störende Dialoge beenden."""
+    if not CFG.wayland:
+        env = {**os.environ, "DISPLAY": ":0"}
+        subprocess.run(["xsetroot", "-solid", "black"], env=env, capture_output=True)
+    if CFG.disable_wifi:
+        subprocess.run(["nmcli", "radio", "wifi", "off"], capture_output=True)
+        subprocess.run(["rfkill", "block", "wifi"], capture_output=True)
+        subprocess.run(
+            ["pkill", "-f", "polkit-mate-authentication-agent"], capture_output=True
+        )
+        subprocess.run(["pkill", "-f", "nm-applet"], capture_output=True)
+    log_event("init", "Desktop bereinigt" + (", WLAN deaktiviert" if CFG.disable_wifi else ", WLAN bleibt an"))
+
+
+def setup_button(events: "queue.Queue") -> object:
+    """Taster an GPIO (gegen GND, interner Pull-up). Jeder Druck → Ereignis in der Queue."""
+    if not CFG.button_gpio:
+        return None
+    try:
+        from gpiozero import Button
+    except ImportError:
+        log_warn("taster", "gpiozero nicht installiert — Taster deaktiviert")
+        return None
+    button = Button(CFG.button_gpio, pull_up=True, bounce_time=0.05)
+    button.when_pressed = lambda: events.put("press")
+    log_event("taster", f"Taster an GPIO{CFG.button_gpio} bereit")
+    return button
 
 
 def detect_badge(img_path: str) -> str:
@@ -321,64 +344,73 @@ def main() -> None:
     log.info("=" * 60)
     log.info("  ISS Watch gestartet")
     log.info(f"  Stream:     {SEN_STREAM}")
-    log.info(f"  Nachtmodus: {SLEEP_START:02d}:00 – {SLEEP_END:02d}:00")
+    log.info(f"  Nachtmodus: {CFG.sleep_start:02d}:00 – {CFG.sleep_end:02d}:00")
+    log.info(f"  Plattform:  {'Wayland' if CFG.wayland else 'X11'}")
+    if CFG.dashboard_url:
+        cycle = ", ".join(f"{v} {s}s" for v, s in CFG.cycle) if CFG.auto_cycle else "aus"
+        log.info(f"  Wetter:     {CFG.dashboard_url} | Wechsel: {cycle}")
     log.info("=" * 60)
 
     suppress_dialogs()
     wait_for_network()
 
     mpv = MPVController(MPV_SOCKET)
+    display = Display(CFG)
+    windows = kiosk.WlrctlWindows() if CFG.wayland else kiosk.NoWindows()
+    browser = kiosk.Browser(CFG.dashboard_url)
+    views = kiosk.ViewController(CFG, display, windows, mpv, browser, log_event, time.time)
+    events: "queue.Queue[str]" = queue.Queue()
+    button = setup_button(events)  # noqa: F841 – Referenz halten, sonst kein Callback
+
+    views.start()
 
     last_watchdog   = time.time()
     last_badge      = time.time() - BADGE_INTERVAL + 20  # ersten Check nach 20s
     last_heartbeat  = time.time()
     frozen_count    = 0
     recovery_level  = 0   # Eskalationsstufe bei Frozen-Frame (0=OK, 1=reload, 2=start, 3=sys.exit)
-    screen_is_on    = True
 
-    # Direkt beim Start Nachtmodus prüfen
-    if is_sleep_time():
-        log_event("screen", f"Nachtmodus aktiv ({SLEEP_START:02d}:00–{SLEEP_END:02d}:00)")
-        screen_off()
-        screen_is_on = False
-    else:
-        screen_on()
-        mpv.start()
+    def restart_mpv(reload_only: bool = False) -> None:
+        wait_for_network(30)
+        if reload_only:
+            mpv.reload()
+        else:
+            mpv.start()
+        views.refocus()  # neues mpv-Fenster nicht vor das Wetter legen
 
     while True:
         try:
-            now     = time.time()
-            in_sleep = is_sleep_time()
-
-            # ── Nacht/Tag-Übergang ────────────────────────────────────────────
-            if in_sleep and screen_is_on:
-                log_event("screen", "Nachtmodus: mpv stoppen, Bildschirm aus")
-                mpv.kill()
-                screen_off()
-                screen_is_on = False
-                frozen_count = 0
-
-            elif not in_sleep and not screen_is_on:
-                log_event("screen", "Tagmodus: Bildschirm an, Stream starten")
-                screen_on()
-                screen_is_on = True
-                wait_for_network(60)
-                mpv.start()
+            # ── Taster, Nachtmodus, automatischer Wechsel ─────────────────────
+            while not events.empty():
+                events.get_nowait()
+                views.press()
+            previous_view = views.view
+            views.tick()
+            if previous_view == "off" and views.view != "off":
                 frozen_count   = 0
                 recovery_level = 0
-                last_watchdog  = now
-                last_badge     = now + 20
+                last_watchdog  = time.time()
+                last_badge     = time.time() + 20
 
-            # Nachtmodus: Rest der Schleife überspringen
-            if in_sleep:
-                time.sleep(30)
+            now = time.time()
+
+            # In „Aus“ läuft kein Stream: nur auf Taster und Tagesbeginn warten
+            if views.view == "off":
+                time.sleep(0.25)
                 continue
+
+            # ── Browser am Leben halten ──────────────────────────────────────
+            if CFG.dashboard_url and not browser.is_running():
+                log_warn("browser", "Chromium beendet → Neustart")
+                browser.start()
+                time.sleep(3)
+                views.refocus()
 
             # ── Stündlicher Heartbeat ────────────────────────────────────────
             if now - last_heartbeat >= LOG_HEARTBEAT:
                 last_heartbeat = now
                 log.info(
-                    f"HEARTBEAT | mpv läuft: {mpv.is_running()} | "
+                    f"HEARTBEAT | Ansicht: {views.view} | mpv läuft: {mpv.is_running()} | "
                     f"Restarts: {mpv._restarts} | Frozen-Count: {frozen_count}"
                 )
 
@@ -388,23 +420,20 @@ def main() -> None:
 
                 if not mpv.is_running():
                     log_error("watchdog", "mpv-Prozess tot → Neustart")
-                    wait_for_network(30)
-                    mpv.start()
+                    restart_mpv()
                     frozen_count   = 0
                     recovery_level = 0
-                    time.sleep(5)
                     continue
 
                 if not mpv.is_playing():
                     log_warn("watchdog", "Kein Playback → Stream neu laden")
-                    wait_for_network(30)
-                    mpv.reload()
+                    restart_mpv(reload_only=True)
                     frozen_count   = 0
                     recovery_level = 0
-                    time.sleep(5)
                     continue
 
             # ── Badge + Frozen-Frame-Check ───────────────────────────────────
+            # mpv dekodiert auch verdeckt weiter, der Check läuft in beiden Ansichten
             if now - last_badge >= BADGE_INTERVAL:
                 last_badge = now
 
@@ -415,21 +444,19 @@ def main() -> None:
                         if frozen_count >= FROZEN_LIMIT:
                             frozen_count    = 0
                             recovery_level += 1
-                            wait_for_network(30)
                             if recovery_level == 1:
                                 log_warn("frozen",
                                          "Dauerhaft eingefroren → Stream neu laden (Level 1)")
-                                mpv.reload()
+                                restart_mpv(reload_only=True)
                             elif recovery_level == 2:
                                 log_warn("frozen",
                                          "Reload hat nicht geholfen → mpv Neustart (Level 2)")
-                                mpv.start()
+                                restart_mpv()
                             else:
                                 log_error("frozen",
                                           f"mpv Neustart hat nicht geholfen → "
                                           f"Script-Neustart via systemd (Level {recovery_level})")
                                 sys.exit(1)   # systemd Restart=always startet Script neu
-                            time.sleep(10)
                             continue
                     else:
                         if recovery_level > 0:
@@ -447,7 +474,7 @@ def main() -> None:
                 else:
                     log_warn("badge", "Screenshot fehlgeschlagen")
 
-            time.sleep(10)
+            time.sleep(0.25)
 
         except KeyboardInterrupt:
             log.info("Beendet (Ctrl+C)")
@@ -457,6 +484,7 @@ def main() -> None:
             time.sleep(10)
 
     mpv.kill()
+    browser.stop()
     log.info("=" * 60)
     log.info("  ISS Watch beendet")
     log.info("=" * 60)
