@@ -1,7 +1,7 @@
 # ISS Watch
 
-Raspberry Pi Kiosk, der die **Sen 4K ISS-Kamera** als Live-Stream anzeigt.  
-Wenn SEN nicht im Live-Modus ist (Replay, Trailer oder Ausfall), wechselt das System automatisch auf ein aktuelles **EUMETSAT Meteosat Satellitenbild** (Europa).
+Raspberry Pi Kiosk, der den **SEN 4K ISS-Live-Stream** dauerhaft auf einem HDMI-Display anzeigt.  
+Zwischen 01:00 und 06:00 Uhr wird der Bildschirm automatisch abgeschaltet.
 
 ---
 
@@ -10,56 +10,64 @@ Wenn SEN nicht im Live-Modus ist (Replay, Trailer oder Ausfall), wechselt das Sy
 ### Normalbetrieb
 
 `iss_watch.py` startet **mpv** im Vollbild mit dem SEN-YouTube-Live-Stream.  
-Alle 30 Sekunden wird ein Screenshot des laufenden Bildes gemacht und die Badge-Farbe oben links analysiert:
+Alle 60 Sekunden wird ein Screenshot gemacht und ausgewertet:
 
-| Badge | Farbe | Aktion |
-|-------|-------|--------|
-| **Live** | Rot | SEN-Stream weiter anzeigen |
-| **Replay** | Orange | → Wettersatellit |
-| **Trailer** | Türkis | → Wettersatellit |
-| Nicht erkennbar (6×) | — | → Wettersatellit |
+- **Badge-Erkennung:** Die farbige Badge oben links im Bild zeigt an ob SEN live, im Replay oder im Trailer-Modus ist — wird nur geloggt, kein Umschalten.
+- **Frozen-Frame-Erkennung:** Zwei aufeinanderfolgende Frames werden pixelweise verglichen. Ist die mittlere Differenz unter 1,5 (von 255), gilt das Bild als eingefroren.
 
-### Wettersatellit-Fallback
+### Nachtmodus (01:00–06:00 Uhr)
 
-Sobald SEN nicht live ist, wird ein aktuelles Satellitenbild direkt vom  
-EUMETSAT-Betreiber geladen (`eumetview.eumetsat.int`):
+Der Bildschirm wird per `vcgencmd display_power 0` komplett abgeschaltet (HDMI-Signal weg), mpv wird beendet. Um 06:00 Uhr schaltet sich der Bildschirm wieder an und der Stream startet automatisch neu.
 
-- **Tagsüber (7–19 Uhr):** `EUMETSAT_MSG_VIS006Color_CentralEurope.jpg` — sichtbares Licht
-- **Nachts:** `EUMETSAT_MSGIODC_IR039Color_Europe.jpg` — Infrarot
+> **Warum `vcgencmd`?** Auf dem Raspberry Pi 3 B+ steht die DPMS-Extension (xset dpms) nicht zur Verfügung. `vcgencmd display_power` ist der einzige zuverlässige Weg den HDMI-Ausgang komplett auszuschalten.
 
-Das Bild wird alle 15 Minuten aktualisiert.  
-Alle 5 Minuten wird geprüft, ob SEN wieder live ist.
+### Watchdog (alle 30 Sekunden)
 
-### Watchdog
+| Situation | Reaktion |
+|-----------|----------|
+| mpv-Prozess tot | mpv komplett neu starten |
+| Kein Playback-Fortschritt (3× in Folge) | Stream in mpv neu laden (`loadfile`) |
 
-Alle 30 Sekunden prüft der Watchdog ob mpv noch Playback liefert.  
-Bei Absturz oder eingefrorenem Bild (3× kein Fortschritt) wird der Stream  
-automatisch neu geladen.
+### Frozen-Frame-Recovery (stufenweise Eskalation)
+
+Wenn 4 aufeinanderfolgende Screenshots als eingefroren erkannt werden:
+
+| Stufe | Aktion |
+|-------|--------|
+| **Level 1** | `mpv.reload()` — Stream-URL in laufendem mpv neu laden |
+| **Level 2** | `mpv.start()` — mpv komplett killen und neu starten |
+| **Level 3** | `sys.exit(1)` — Script beendet sich, **systemd startet es automatisch neu** |
+
+Sobald wieder ein nicht-eingefrorener Frame erkannt wird, wird der Recovery-Level auf 0 zurückgesetzt.
 
 ### WLAN deaktiviert
 
-Der Pi ist per LAN angeschlossen. Beim Start wird WLAN per `nmcli` und `rfkill`  
-deaktiviert, um nm-applet-Passwort-Popups dauerhaft zu verhindern.
+Der Pi ist per LAN angeschlossen. Beim Start wird WLAN per `nmcli` und `rfkill` deaktiviert und `nm-applet`/`polkit` werden beendet, um lästige Passwort-Popups dauerhaft zu verhindern.
 
 ---
 
 ## Logging
 
-Alle Ereignisse werden in `iss-watch.log` (neben dem Skript) protokolliert  
-und automatisch rotiert (max. ~16 MB):
+Alle Ereignisse werden in `iss-watch.log` (neben dem Skript) protokolliert und automatisch rotiert (max. ~16 MB, 7 Dateien à 2 MB).
 
 ```
-2026-05-08 14:15:33 | INFO    | ANZEIGE START | SEN Live-Stream
-2026-05-08 14:15:33 | INFO    | ANZEIGE ENDE  | SEN Live-Stream       | Dauer: 1h32m22s
-2026-05-08 14:15:33 | INFO    | ANZEIGE START | EUMETSAT Wetter-Satellit  ← SEN-Badge: replay
-2026-05-08 15:00:00 | INFO    | HEARTBEAT     | Modus: weather | ...
+2026-08-20 14:20:39 | INFO    | EVENT  [screen    ] Bildschirm AN
+2026-08-20 14:20:43 | INFO    | EVENT  [mpv       ] Neustart #1 — https://www.youtube.com/@sen/live
+2026-08-20 14:21:08 | INFO    | EVENT  [frozen    ] Frame-Diff 39.77 (Schwelle 1.5)
+2026-08-20 14:21:08 | INFO    | EVENT  [badge     ] SEN-Modus: replay
+2026-08-20 15:20:43 | INFO    | HEARTBEAT | mpv läuft: True | Restarts: 1 | Frozen-Count: 0
+2026-08-20 01:00:xx | INFO    | EVENT  [screen    ] Bildschirm AUS
+2026-08-20 06:00:xx | INFO    | EVENT  [screen    ] Bildschirm AN
 ```
 
-Protokolliert wird u. a.:
-- Anzeigedauer jedes Inhalts (SEN Live, Wetter, Ladezeit/Desktop sichtbar)
-- SEN Badge-Farben (zum Tuning der Erkennung)
-- Watchdog-Ereignisse (eingefroren, IPC-Fehler, Neustart)
-- Netzwerkausfälle und EUMETSAT Download-Fehler
+Protokolliert wird:
+- Bildschirm an/aus (Nachtmodus)
+- mpv-Starts und Neustarts (nummeriert)
+- Frame-Differenz bei jedem Screenshot-Check
+- Badge-Farbe (live / replay / trailer / unknown)
+- Watchdog-Ereignisse (kein Fortschritt, Prozess tot)
+- Frozen-Frame-Eskalation (Level 1–3)
+- Netzwerkstatus
 - Stündlicher Heartbeat
 
 **Live-Log:**
@@ -72,8 +80,7 @@ tail -f ~/iss/iss-watch.log
 ## Cookie-Automatisierung
 
 YouTube erfordert eine angemeldete Session für den SEN-Live-Stream.  
-Das Skript `update-iss-cookies.sh` exportiert wöchentlich automatisch  
-frische Cookies aus Firefox und deployed sie auf den Pi.
+Das Skript `update-iss-cookies.sh` exportiert wöchentlich automatisch frische Cookies aus Firefox und deployed sie auf den Pi.
 
 **Einmalige Voraussetzung:** In Firefox bei YouTube/Google eingeloggt sein.
 
@@ -94,21 +101,16 @@ cat ~/.local/share/iss-watch-cookies.log
 ## Voraussetzungen
 
 ### Hardware
-- Raspberry Pi 3 oder neuer (64-bit Raspberry Pi OS)
+- Raspberry Pi 3 B+ oder neuer
 - HDMI-Display
-- LAN-Verbindung (WLAN wird deaktiviert)
-- X11-Desktop-Session
+- LAN-Verbindung (WLAN wird vom Script deaktiviert)
+- X11-Desktop-Session (kein Wayland)
 
 ### Software (Pi)
 
 **System-Pakete:**
 ```bash
-sudo apt install -y mpv ffmpeg python3-pip python3-opencv fonts-liberation
-```
-
-**Python-Pakete:**
-```bash
-pip3 install numpy --break-system-packages
+sudo apt install -y mpv python3-opencv
 ```
 
 **yt-dlp:**
@@ -117,6 +119,8 @@ sudo apt install yt-dlp
 # oder aktuellste Version:
 pip3 install yt-dlp --break-system-packages
 ```
+
+> `numpy` wird nicht mehr separat benötigt — OpenCV bringt es mit.
 
 ---
 
@@ -129,6 +133,10 @@ pip3 install yt-dlp --break-system-packages
 ├── iss_watch.py
 ├── iss-watch.service
 └── iss-watch.desktop
+```
+
+```bash
+scp iss_watch.py iss-watch.service iss-watch.desktop axel@iss:~/iss/
 ```
 
 ### 2. Systemd User-Service einrichten
@@ -158,7 +166,7 @@ Auf dem Desktop-Rechner — Firefox muss bei YouTube eingeloggt sein:
 ./update-iss-cookies.sh
 ```
 
-Dann den wöchentlichen Cron-Job einrichten (einmalig auf dem Desktop):
+Wöchentlichen Cron-Job einrichten (einmalig auf dem Desktop):
 ```bash
 SCRIPT="$(pwd)/update-iss-cookies.sh"
 (crontab -l 2>/dev/null; echo "0 3 * * 1  $SCRIPT >> /dev/null 2>&1") | crontab -
@@ -195,6 +203,11 @@ systemctl --user restart iss-watch
 tail -f ~/iss/iss-watch.log
 ```
 
+**Script manuell starten (zum Testen):**
+```bash
+python3 ~/iss/iss_watch.py
+```
+
 ---
 
 ## Konfiguration
@@ -203,16 +216,19 @@ Alle Parameter am Anfang von `iss_watch.py`:
 
 | Variable | Standard | Beschreibung |
 |----------|----------|--------------|
-| `SEN_STREAM` | `@sen/live` | YouTube-URL des SEN-Streams |
-| `WEATHER_DAY_URL` | EUMETSAT VIS006 | Satellitenbild tagsüber |
-| `WEATHER_NIGHT_URL` | EUMETSAT IR039 | Satellitenbild nachts |
-| `WEATHER_REFRESH` | 15 min | Aktualisierungsintervall Wetterbild |
-| `SEN_MODE_INTERVAL` | 30 s | Wie oft SEN-Badge geprüft wird |
-| `SEN_FALLBACK_RETRY` | 5 min | Wie oft auf SEN-Rückkehr geprüft wird |
-| `SEN_UNKNOWN_LIMIT` | 6 | Unlesbare Badges bis Fallback |
-| `WATCHDOG_INTERVAL` | 30 s | Watchdog-Takt |
-| `WATCHDOG_MAX_STUCK` | 3 | Eingefrorene Frames bis Neustart |
-| `LOG_BACKUP_COUNT` | 7 | Anzahl rotierter Log-Dateien |
+| `SEN_STREAM` | `https://youtube.com/@sen/live` | YouTube-URL des SEN-Streams |
+| `YT_COOKIES` | `~/projects/iss-watch/yt-cookies.txt` | Pfad zur YouTube-Cookie-Datei |
+| `SLEEP_START` | `1` | Nachtmodus ab dieser Stunde (01:00) |
+| `SLEEP_END` | `6` | Nachtmodus bis zu dieser Stunde (06:00) |
+| `WATCHDOG_INTERVAL` | `30 s` | Takt des Watchdogs |
+| `WATCHDOG_MAX_STUCK` | `3` | Aufeinanderfolgende Nicht-Fortschritt-Messungen bis Reload |
+| `STARTUP_GRACE` | `90 s` | Schonfrist nach mpv-Neustart (kein Watchdog-Alarm) |
+| `BADGE_INTERVAL` | `60 s` | Sekunden zwischen Screenshot-Checks |
+| `FROZEN_DIFF` | `1.5` | Pixel-Differenz-Schwelle (0–255); Live-Stream liegt typ. bei >5 |
+| `FROZEN_LIMIT` | `4` | Aufeinanderfolgende eingefrorene Frames bis Recovery |
+| `LOG_MAX_BYTES` | `2 MB` | Maximale Größe einer Log-Datei |
+| `LOG_BACKUP_COUNT` | `7` | Anzahl rotierter Log-Dateien (max. ~16 MB gesamt) |
+| `LOG_HEARTBEAT` | `60 min` | Intervall des stündlichen Heartbeat-Eintrags |
 
 ---
 
@@ -221,13 +237,12 @@ Alle Parameter am Anfang von `iss_watch.py`:
 | Datei | Beschreibung |
 |-------|--------------|
 | `iss_watch.py` | Hauptskript |
-| `iss-watch.service` | systemd User-Service |
-| `iss-watch.desktop` | XDG Autostart |
-| `update-iss-cookies.sh` | Automatisches Cookie-Update (Desktop → Pi) |
+| `iss-watch.service` | systemd User-Service (`Restart=always`, `RestartSec=15`) |
+| `iss-watch.desktop` | XDG Autostart für Desktop-Login |
+| `update-iss-cookies.sh` | Exportiert Firefox-Cookies und kopiert sie auf den Pi |
 
 ---
 
 ## Quellen
 
 - SEN 4K ISS-Kamera: [youtube.com/@sen/live](https://www.youtube.com/@sen/live)
-- EUMETSAT Satellitenbilder: [eumetview.eumetsat.int](https://eumetview.eumetsat.int/static-images/latestImages/)
