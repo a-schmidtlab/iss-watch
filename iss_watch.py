@@ -290,8 +290,9 @@ def setup_button(events: "queue.Queue") -> object:
     except ImportError:
         log_warn("taster", "gpiozero nicht installiert — Taster deaktiviert")
         return None
-    button = Button(CFG.button_gpio, pull_up=True, bounce_time=0.05)
-    button.when_pressed = lambda: events.put("press")
+    button = Button(CFG.button_gpio, pull_up=True, bounce_time=0.1)
+    # Zeitpunkt des Drucks mitgeben: die Sperrzeit gilt ab dem Druck, nicht ab der Verarbeitung
+    button.when_pressed = lambda: events.put(time.time())
     log_event("taster", f"Taster an GPIO{CFG.button_gpio} bereit")
     return button
 
@@ -382,8 +383,9 @@ def main() -> None:
         try:
             # ── Taster, Nachtmodus, automatischer Wechsel ─────────────────────
             while not events.empty():
-                events.get_nowait()
-                views.press()
+                pressed_at = events.get_nowait()
+                if not views.press(pressed_at):
+                    log_event("taster", "Preller verworfen")
             previous_view = views.view
             views.tick()
             if previous_view == "off" and views.view != "off":

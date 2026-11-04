@@ -144,18 +144,22 @@ class ViewController:
     - Startansicht aus der Konfiguration (wetterraspi5: Wetter)
     - auto_cycle: wechselt nach den Dauern in `cycle`, solange die Ansicht
       ISS oder Wetter ist
-    - Taster: ISS → Wetter → Aus → ISS. Drücke bis 300 ms nach einem Wechsel
-      werden ignoriert. In „Aus“ ruht der automatische Wechsel.
+    - Taster: ISS → Wetter → Aus → ISS. Ein Druck bis 500 ms nach dem letzten
+      angenommenen Druck wird ignoriert (Prellen). Maßgeblich ist der Zeitpunkt
+      des Drucks, nicht der Verarbeitung: ein Wechsel kann Sekunden dauern
+      (mpv-Start), Preller warten so lange in der Queue. In „Aus“ ruht der
+      automatische Wechsel.
     - Nachtmodus: um sleep_start auf „Aus“, um sleep_end zurück zur gemerkten Ansicht
     """
 
-    LOCKOUT = 0.3
+    LOCKOUT = 0.5
 
     def __init__(self, cfg: Config, display, windows, mpv, browser, log_event, now) -> None:
         self.cfg, self.display, self.windows = cfg, display, windows
         self.mpv, self.browser, self.log_event, self.now = mpv, browser, log_event, now
         self.view = None
         self.since = 0.0
+        self.last_press = float("-inf")
         self.night = False
         self.remembered = cfg.start_view
         self.has_weather = bool(cfg.dashboard_url)
@@ -201,13 +205,17 @@ class ViewController:
         else:
             self.set_view(self.cfg.start_view, "Start")
 
-    def press(self) -> None:
-        """Taster: zur nächsten Ansicht."""
-        if self.now() - self.since < self.LOCKOUT:
-            return
+    def press(self, at: float = None) -> bool:
+        """Taster: zur nächsten Ansicht. `at` = Zeitpunkt des Drucks (aus dem
+        GPIO-Callback). Gibt False zurück, wenn der Druck als Preller verworfen wurde."""
+        at = self.now() if at is None else at
+        if at - self.last_press < self.LOCKOUT:
+            return False
+        self.last_press = at
         order = list(VIEWS) if self.has_weather else ["iss", "off"]
         nxt = order[(order.index(self.view) + 1) % len(order)]
         self.set_view(nxt, "Taster")
+        return True
 
     def tick(self) -> None:
         sleep = self.is_sleep_time()

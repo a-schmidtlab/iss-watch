@@ -76,13 +76,28 @@ def test_button_cycles_iss_weather_off():
     assert vc.view == "weather"
 
 
-def test_button_lockout_300ms():
+def test_button_lockout_500ms():
     vc, clock, *_ = make()
     vc.start()
     clock.advance(1); vc.press()
     assert vc.view == "off"
-    clock.advance(0.1); vc.press()   # Prellen / Doppeldruck
+    clock.advance(0.1); assert vc.press() is False   # Prellen / Doppeldruck
     assert vc.view == "off"
+    clock.advance(0.6); vc.press()
+    assert vc.view == "iss"
+
+
+def test_bounce_queued_during_slow_switch_is_ignored():
+    """Preller kommt 80 ms nach dem Druck, wird aber erst nach dem langsamen
+    Wechsel (mpv-Start, 3 s) verarbeitet: er darf nicht weiterschalten."""
+    vc, clock, *_ = make()
+    vc.start()                              # Wetter
+    clock.advance(5); vc.press()            # → Aus
+    pressed = clock.t + 1
+    clock.t = pressed; vc.press(pressed)    # → ISS (mpv-Start dauert)
+    clock.advance(3)
+    assert vc.press(pressed + 0.08) is False
+    assert vc.view == "iss"
 
 
 def test_off_pauses_auto_cycle():
