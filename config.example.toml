@@ -8,8 +8,9 @@
 dashboard_url = "http://127.0.0.1:8080/kiosk.html"
 start_view = "weather"            # iss | weather | off – nach jedem Start
 
-# Automatischer Wechsel (solange kein „Aus“ gewählt ist)
-auto_cycle = true
+# Automatischer Wechsel: aus, geschaltet wird nur mit dem Taster.
+# Zum Einschalten: auto_cycle = true, Dauern in Sekunden
+auto_cycle = false
 cycle = [["iss", 60], ["weather", 30]]
 
 # Taster an GPIO21 (Pin 40) gegen GND (Pin 39), unterste Reihe der Stiftleiste.
@@ -24,7 +25,7 @@ display_backend = "auto"          # auto | vcgencmd | wlr-randr
 output = "HDMI-A-1"
 output_transform = "180"
 
-# Nachtmodus
+# Nachtmodus: Bildschirm aus. Ein Tastendruck in der Nacht hebt ihn für diese Nacht auf.
 sleep_start = 1
 sleep_end = 6
 

@@ -207,6 +207,14 @@ class MPVController:
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def is_ready(self) -> bool:
+        """Stream spielt: Datei geladen (playback-time vorhanden) und nicht am Puffern."""
+        if not self.is_running():
+            return False
+        pos = self.send(["get_property", "playback-time"], timeout=1)
+        idle = self.send(["get_property", "core-idle"], timeout=1)
+        return bool(pos and pos.get("data") is not None and idle and idle.get("data") is False)
+
     def is_playing(self) -> bool:
         """Watchdog: Hat der Stream Fortschritt? Gibt False → Reload nötig."""
         grace_left = STARTUP_GRACE - (time.time() - self._started_at)
@@ -385,7 +393,8 @@ def main() -> None:
             while not events.empty():
                 pressed_at = events.get_nowait()
                 if not views.press(pressed_at):
-                    log_event("taster", "Preller verworfen")
+                    reason = "Stream lädt noch" if views.stream_loading() else "Preller"
+                    log_event("taster", f"Druck ignoriert ({reason})")
             previous_view = views.view
             views.tick()
             if previous_view == "off" and views.view != "off":

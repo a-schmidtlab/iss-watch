@@ -142,17 +142,21 @@ class ViewController:
     """Zustandsautomat der Ansichten.
 
     - Startansicht aus der Konfiguration (wetterraspi5: Wetter)
-    - auto_cycle: wechselt nach den Dauern in `cycle`, solange die Ansicht
-      ISS oder Wetter ist
+    - auto_cycle (optional): wechselt nach den Dauern in `cycle`, solange die
+      Ansicht ISS oder Wetter ist. Auf dem wetterraspi5 aus (nur Taster).
     - Taster: ISS → Wetter → Aus → ISS. Ein Druck bis 500 ms nach dem letzten
       angenommenen Druck wird ignoriert (Prellen). Maßgeblich ist der Zeitpunkt
       des Drucks, nicht der Verarbeitung: ein Wechsel kann Sekunden dauern
-      (mpv-Start), Preller warten so lange in der Queue. In „Aus“ ruht der
-      automatische Wechsel.
-    - Nachtmodus: um sleep_start auf „Aus“, um sleep_end zurück zur gemerkten Ansicht
+      (mpv-Start), Preller warten so lange in der Queue.
+    - Solange der Stream in der Ansicht ISS noch lädt, nimmt der Taster nichts an
+      (höchstens STREAM_WAIT Sekunden, damit man ohne Stream nicht festhängt).
+    - Nachtmodus: um sleep_start auf „Aus“, um sleep_end zurück zur gemerkten
+      Ansicht. Ein Tastendruck in der Nacht hebt den Nachtmodus für diese Nacht
+      auf: die gewählte Ansicht bleibt, auch über sleep_end hinaus.
     """
 
     LOCKOUT = 0.5
+    STREAM_WAIT = 30
 
     def __init__(self, cfg: Config, display, windows, mpv, browser, log_event, now) -> None:
         self.cfg, self.display, self.windows = cfg, display, windows
@@ -161,6 +165,7 @@ class ViewController:
         self.since = 0.0
         self.last_press = float("-inf")
         self.night = False
+        self.night_override = False
         self.remembered = cfg.start_view
         self.has_weather = bool(cfg.dashboard_url)
 
@@ -211,11 +216,21 @@ class ViewController:
         at = self.now() if at is None else at
         if at - self.last_press < self.LOCKOUT:
             return False
+        if self.stream_loading():
+            return False
         self.last_press = at
+        if self.night and not self.night_override:
+            self.night_override = True
+            self.log_event("view", "Nachtmodus für diese Nacht aufgehoben (Taster)")
         order = list(VIEWS) if self.has_weather else ["iss", "off"]
         nxt = order[(order.index(self.view) + 1) % len(order)]
         self.set_view(nxt, "Taster")
         return True
+
+    def stream_loading(self) -> bool:
+        """True, solange in der Ansicht ISS der Stream noch nicht abspielt."""
+        return (self.view == "iss" and self.now() - self.since < self.STREAM_WAIT
+                and not self.mpv.is_ready())
 
     def tick(self) -> None:
         sleep = self.is_sleep_time()
@@ -226,6 +241,10 @@ class ViewController:
             return
         if not sleep and self.night:
             self.night = False
+            if self.night_override:
+                # In der Nacht von Hand geschaltet: Ansicht bleibt wie gewählt
+                self.night_override = False
+                return
             self.set_view(self.remembered, "Tagmodus")
             return
         if self.cfg.auto_cycle and self.has_weather and self.view in ("iss", "weather"):
