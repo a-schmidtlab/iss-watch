@@ -12,8 +12,9 @@ start_view = "weather"            # iss | weather | off – nach jedem Start
 auto_cycle = true
 cycle = [["iss", 60], ["weather", 30]]
 
-# Taster an GPIO17 (Pin 11) gegen GND (Pin 9): ISS → Wetter → Aus → ISS
-button_gpio = 17
+# Taster an GPIO21 (Pin 40) gegen GND (Pin 39), unterste Reihe der Stiftleiste.
+# Pin 1–10 sind am wetterraspi5 durch den NVMe-HAT belegt. ISS → Wetter → Aus → ISS
+button_gpio = 21
 
 # WLAN ist hier die Reserve neben LAN und bleibt an
 disable_wifi = false
