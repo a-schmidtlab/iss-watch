@@ -1,7 +1,35 @@
 # ISS Watch
 
-Raspberry Pi Kiosk, der den **SEN 4K ISS-Live-Stream** dauerhaft auf einem HDMI-Display anzeigt.  
-Zwischen 01:00 und 06:00 Uhr wird der Bildschirm automatisch abgeschaltet.
+Raspberry Pi Kiosk für einen HDMI-Bildschirm mit drei Ansichten: **SEN 4K ISS-Live-Stream**,
+**Wetter-Dashboard** und **Aus**. Ein Taster schaltet zyklisch weiter, zwischen 01:00 und
+06:00 Uhr geht der Bildschirm automatisch aus. Läuft seit November 2026 auf dem
+**wetterraspi5** (Raspberry Pi 5, Wayland/labwc) und hat den alten iss-Pi (Pi 3, X11) abgelöst.
+Derselbe Code läuft weiter unter X11, dann ohne Wetteransicht.
+
+---
+
+## Ansichten und Taster
+
+| Ansicht | Bildschirm |
+|---------|------------|
+| ISS | mpv im Vollbild, Ton immer stumm |
+| Wetter | Chromium im Kiosk-Modus mit der lokalen Kiosk-Seite des Repos `wetterstation` |
+| Aus | HDMI aus, mpv beendet |
+
+- **Start:** immer die Ansicht aus `start_view`, auf dem wetterraspi5 Wetter. Im Nachtmodus Aus.
+- **Taster** an **Pin 40 (GPIO21)** und **Pin 39 (GND)**, interner Pull-up, kein Widerstand nötig.
+  Pin 1–10 belegt am wetterraspi5 der NVMe-HAT. Jeder Druck schaltet ISS → Wetter → Aus → ISS.
+- **Prellen:** Ein Druck bis 500 ms nach dem letzten angenommenen Druck wird verworfen.
+  Maßgeblich ist der Zeitpunkt des Drucks, nicht der Verarbeitung, denn ein Wechsel kann
+  wegen des mpv-Starts Sekunden dauern.
+- **Stream lädt:** Solange der Stream in der Ansicht ISS noch nicht abspielt, nimmt der Taster
+  nichts an, höchstens 30 s lang. Ohne Internet hängt man so nicht fest.
+- **Geschaltet wird nur von Hand.** Ein automatischer Wechsel ist möglich (`auto_cycle`),
+  auf dem wetterraspi5 aber aus.
+- **Nachtmodus:** Um 01:00 auf Aus, um 06:00 zurück zur vorherigen Ansicht. Ein Tastendruck in
+  der Nacht hebt den Nachtmodus für diese Nacht auf, die gewählte Ansicht bleibt dann auch nach 06:00.
+- mpv und Chromium laufen in beiden Ansichten nebeneinander, `wlrctl` holt das Fenster nach
+  vorn. mpv dekodiert verdeckt weiter, deshalb schaltet es sofort um.
 
 ---
 
@@ -9,7 +37,7 @@ Zwischen 01:00 und 06:00 Uhr wird der Bildschirm automatisch abgeschaltet.
 
 ### Normalbetrieb
 
-`iss_watch.py` startet **mpv** im Vollbild mit dem SEN-YouTube-Live-Stream.  
+`iss_watch.py` startet **mpv** im Vollbild mit dem SEN-YouTube-Live-Stream, `kiosk.py` steuert die Ansichten.  
 Alle 60 Sekunden wird ein Screenshot gemacht und ausgewertet:
 
 - **Badge-Erkennung:** Die farbige Badge oben links im Bild zeigt an ob SEN live, im Replay oder im Trailer-Modus ist — wird nur geloggt, kein Umschalten.
@@ -17,9 +45,9 @@ Alle 60 Sekunden wird ein Screenshot gemacht und ausgewertet:
 
 ### Nachtmodus (01:00–06:00 Uhr)
 
-Der Bildschirm wird per `vcgencmd display_power 0` komplett abgeschaltet (HDMI-Signal weg), mpv wird beendet. Um 06:00 Uhr schaltet sich der Bildschirm wieder an und der Stream startet automatisch neu.
+Der HDMI-Ausgang wird abgeschaltet, mpv wird beendet: unter Wayland per `wlr-randr --output … --off`, beim Einschalten mit `--transform`, damit die Drehung des Bildschirms erhalten bleibt, unter X11 per `vcgencmd display_power`.
 
-> **Warum `vcgencmd`?** Auf dem Raspberry Pi 3 B+ steht die DPMS-Extension (xset dpms) nicht zur Verfügung. `vcgencmd display_power` ist der einzige zuverlässige Weg den HDMI-Ausgang komplett auszuschalten.
+> **Warum `vcgencmd` unter X11?** Auf dem Raspberry Pi 3 B+ steht die DPMS-Extension (xset dpms) nicht zur Verfügung.
 
 ### Watchdog (alle 30 Sekunden)
 
@@ -40,9 +68,11 @@ Wenn 4 aufeinanderfolgende Screenshots als eingefroren erkannt werden:
 
 Sobald wieder ein nicht-eingefrorener Frame erkannt wird, wird der Recovery-Level auf 0 zurückgesetzt.
 
-### WLAN deaktiviert
+> **Bekannter Punkt (Stand 06.11.2026):** Auf der Nachtseite der Erde zeigt der Stream fast nur schwarz. Die Frame-Differenz fällt dann unter 1,5, obwohl das Bild nicht eingefroren ist: 280 von 1387 Messungen lagen unter der Schwelle. Das löst unnötige Reloads aus und kann bis zu Level 3 eskalieren, zuletzt am 05.11. um 11:00. Dabei startet das Skript neu und springt auf die Startansicht. Die Erkennung sollte künftig das Abspielen selbst prüfen oder Nachtbilder ausnehmen.
 
-Der Pi ist per LAN angeschlossen. Beim Start wird WLAN per `nmcli` und `rfkill` deaktiviert und `nm-applet`/`polkit` werden beendet, um lästige Passwort-Popups dauerhaft zu verhindern.
+### WLAN
+
+Mit `disable_wifi = true` wird WLAN beim Start per `nmcli` und `rfkill` abgeschaltet, um Passwort-Popups zu verhindern (alter iss-Pi). Auf dem wetterraspi5 ist WLAN die Reserve neben LAN und bleibt an.
 
 ---
 
@@ -79,8 +109,7 @@ tail -f ~/iss/iss-watch.log
 
 ## Cookie-Automatisierung
 
-YouTube erfordert eine angemeldete Session für den SEN-Live-Stream.  
-Das Skript `update-iss-cookies.sh` exportiert wöchentlich automatisch frische Cookies aus Firefox und deployed sie auf den Pi.
+Auf dem alten iss-Pi brauchte YouTube eine angemeldete Session. Auf dem wetterraspi5 läuft der Stream bisher auch ohne Cookies. `update-iss-cookies.sh` exportiert bei Bedarf frische Cookies aus Firefox und kopiert sie auf den wetterraspi5.
 
 **Einmalige Voraussetzung:** In Firefox bei YouTube/Google eingeloggt sein.
 
@@ -101,23 +130,22 @@ cat ~/.local/share/iss-watch-cookies.log
 ## Voraussetzungen
 
 ### Hardware
-- Raspberry Pi 3 B+ oder neuer
+- Raspberry Pi 5 mit Wayland (labwc), oder Raspberry Pi 3 B+ mit X11 (dann ohne Wetteransicht)
 - HDMI-Display
-- LAN-Verbindung (WLAN wird vom Script deaktiviert)
-- X11-Desktop-Session (kein Wayland)
+- LAN-Verbindung
+- optional Taster gegen GND
 
 ### Software (Pi)
 
 **System-Pakete:**
 ```bash
-sudo apt install -y mpv python3-opencv
+sudo apt install -y mpv python3-opencv python3-gpiozero python3-lgpio chromium wlrctl wlr-randr
 ```
 
-**yt-dlp:**
+**yt-dlp** im eigenen venv, die Debian-Version veraltet schnell:
 ```bash
-sudo apt install yt-dlp
-# oder aktuellste Version:
-pip3 install yt-dlp --break-system-packages
+python3 -m venv ~/.local/share/iss-watch/venv
+~/.local/share/iss-watch/venv/bin/pip install -U yt-dlp
 ```
 
 > `numpy` wird nicht mehr separat benötigt — OpenCV bringt es mit.
@@ -128,35 +156,31 @@ pip3 install yt-dlp --break-system-packages
 
 ### 1. Dateien auf den Pi kopieren
 
-```
-~/iss/
-├── iss_watch.py
-├── iss-watch.service
-└── iss-watch.desktop
-```
+Auf dem wetterraspi5 erledigt das `deploy/bootstrap-pi.sh` im Repo `wetterstation`. Von Hand:
 
 ```bash
-scp iss_watch.py iss-watch.service iss-watch.desktop axel@iss:~/iss/
+scp iss_watch.py kiosk.py wetterraspi5:iss/
+scp config.example.toml wetterraspi5:.config/iss-watch/config.toml
 ```
 
 ### 2. Systemd User-Service einrichten
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ~/iss/iss-watch.service ~/.config/systemd/user/
-
-loginctl enable-linger $USER
+cp iss-watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable iss-watch
-systemctl --user start iss-watch
 ```
 
 ### 3. Autostart bei Desktop-Login
 
 ```bash
 mkdir -p ~/.config/autostart
-cp ~/iss/iss-watch.desktop ~/.config/autostart/
+cp iss-watch.desktop ~/.config/autostart/
 ```
+
+Der Eintrag übergibt `WAYLAND_DISPLAY` an den User-Service und startet ihn. Unter labwc gehört das
+**nicht** nach `~/.config/labwc/autostart`: Diese Datei würde die Systemdatei ersetzen, dann
+starten kanshi (Bildschirmdrehung) und das Panel nicht mehr.
 
 ### 4. YouTube-Cookies einrichten (einmalig)
 
@@ -172,16 +196,10 @@ SCRIPT="$(pwd)/update-iss-cookies.sh"
 (crontab -l 2>/dev/null; echo "0 3 * * 1  $SCRIPT >> /dev/null 2>&1") | crontab -
 ```
 
-### 5. WLAN permanent deaktivieren (optional, empfohlen)
+### 5. yt-dlp aktuell halten (empfohlen)
 
 ```bash
-echo "dtoverlay=disable-wifi" | sudo tee -a /boot/firmware/config.txt
-```
-
-### 6. yt-dlp täglich aktualisieren (empfohlen)
-
-```bash
-(crontab -l 2>/dev/null; echo "0 4 * * *  yt-dlp -U") | crontab -
+(crontab -l 2>/dev/null; echo "0 4 * * *  ~/.local/share/iss-watch/venv/bin/pip install -qU yt-dlp") | crontab -
 ```
 
 ---
@@ -212,14 +230,24 @@ python3 ~/iss/iss_watch.py
 
 ## Konfiguration
 
-Alle Parameter am Anfang von `iss_watch.py`:
+`~/.config/iss-watch/config.toml`, alle Werte optional, Vorlage: `config.example.toml`.
+
+| Option | Standard | Beschreibung |
+|--------|----------|--------------|
+| `dashboard_url` | leer | Wetter-Dashboard; leer = keine Wetteransicht |
+| `start_view` | `iss` | Ansicht nach jedem Start: `iss`, `weather` oder `off` |
+| `auto_cycle`, `cycle` | `false` | automatischer Wechsel mit Dauern in Sekunden |
+| `button_gpio` | `0` | GPIO des Tasters, 0 = kein Taster |
+| `disable_wifi` | `true` | WLAN beim Start abschalten |
+| `display_backend` | `auto` | `auto`, `vcgencmd` oder `wlr-randr` |
+| `output`, `output_transform` | `HDMI-A-1`, `normal` | Ausgang und Drehung (`180` am wetterraspi5) |
+| `sleep_start`, `sleep_end` | `1`, `6` | Nachtmodus |
+| `stream_url`, `cookies`, `ytdl_path` | SEN, Cookie-Pfad, leer | Stream und yt-dlp |
+
+Am Anfang von `iss_watch.py`:
 
 | Variable | Standard | Beschreibung |
 |----------|----------|--------------|
-| `SEN_STREAM` | `https://youtube.com/@sen/live` | YouTube-URL des SEN-Streams |
-| `YT_COOKIES` | `~/projects/iss-watch/yt-cookies.txt` | Pfad zur YouTube-Cookie-Datei |
-| `SLEEP_START` | `1` | Nachtmodus ab dieser Stunde (01:00) |
-| `SLEEP_END` | `6` | Nachtmodus bis zu dieser Stunde (06:00) |
 | `WATCHDOG_INTERVAL` | `30 s` | Takt des Watchdogs |
 | `WATCHDOG_MAX_STUCK` | `3` | Aufeinanderfolgende Nicht-Fortschritt-Messungen bis Reload |
 | `STARTUP_GRACE` | `90 s` | Schonfrist nach mpv-Neustart (kein Watchdog-Alarm) |
@@ -236,10 +264,13 @@ Alle Parameter am Anfang von `iss_watch.py`:
 
 | Datei | Beschreibung |
 |-------|--------------|
-| `iss_watch.py` | Hauptskript |
+| `iss_watch.py` | Hauptskript: mpv, Watchdog, Frozen-Frame-Erkennung, Hauptschleife |
+| `kiosk.py` | Konfiguration, Display-Adapter, Browser, Zustandsautomat der Ansichten |
+| `config.example.toml` | Vorlage für die Konfiguration (Werte des wetterraspi5) |
+| `tests/test_kiosk.py` | Tests des Zustandsautomaten ohne Hardware |
 | `iss-watch.service` | systemd User-Service (`Restart=always`, `RestartSec=15`) |
 | `iss-watch.desktop` | XDG Autostart für Desktop-Login |
-| `update-iss-cookies.sh` | Exportiert Firefox-Cookies und kopiert sie auf den Pi |
+| `update-iss-cookies.sh` | Exportiert Firefox-Cookies und kopiert sie auf den wetterraspi5 |
 
 ---
 
