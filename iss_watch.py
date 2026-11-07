@@ -15,6 +15,7 @@ import shutil
 import logging
 import logging.handlers
 import queue
+import threading
 import urllib.request
 import cv2
 
@@ -38,6 +39,8 @@ STARTUP_GRACE      = 90   # Schonfrist nach Neustart (Sekunden)
 BADGE_INTERVAL  = 60   # Sekunden zwischen Screenshot-Checks
 FROZEN_DIFF     = 1.5  # Pixeldifferenz-Schwelle (0–255); Live-Stream typ. >5
 FROZEN_LIMIT    = 4    # N eingefrorene Frames → Reload
+
+GUARD_INTERVAL = 1     # Sekunden zwischen Prüfungen, ob der Bildschirm die Ansicht zeigt
 
 SEN_SCREENSHOT = "/tmp/sen_frame.png"
 SEN_PREV_SHOT  = "/tmp/sen_frame_prev.png"
@@ -101,8 +104,12 @@ class Display:
     """Bildschirm an/aus mit Log, je nach Plattform vcgencmd oder wlr-randr."""
 
     def __init__(self, cfg: kiosk.Config) -> None:
-        self.impl = (kiosk.WlrRandrDisplay(cfg.output, cfg.output_transform) if cfg.wayland
-                     else kiosk.VcgencmdDisplay())
+        if cfg.display_backend == "ddc":
+            self.impl = kiosk.DdcDisplay(cfg.ddc_bus)
+        elif cfg.wayland:
+            self.impl = kiosk.WlrRandrDisplay(cfg.output, cfg.output_transform)
+        else:
+            self.impl = kiosk.VcgencmdDisplay()
 
     def on(self) -> None:
         self.impl.on()
@@ -112,11 +119,15 @@ class Display:
         self.impl.off()
         log_event("screen", "Bildschirm AUS")
 
+    def is_on(self) -> bool:
+        return self.impl.is_on()
+
 
 # ── MPV-Controller ────────────────────────────────────────────────────────────
 
 class MPVController:
     def __init__(self, socket_path: str) -> None:
+        self.lock         = threading.RLock()  # Ansichten und Überwachung teilen sich mpv
         self.socket_path  = socket_path
         self.proc         = None
         self._last_pos    = None
@@ -126,6 +137,10 @@ class MPVController:
 
     def start(self) -> None:
         """Beendet laufende mpv-Instanz und startet neu mit SEN-Stream."""
+        with self.lock:
+            self._start()
+
+    def _start(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             time.sleep(2)
@@ -141,6 +156,8 @@ class MPVController:
             "--no-terminal",
             "--no-osc",
             "--idle=yes",
+            # Fenster bleibt beim Neuladen bestehen, sonst legt es sich neu nach vorn
+            "--force-window=immediate",
             "--keep-open=no",
             "--mute=yes",
             "--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]",
@@ -173,12 +190,13 @@ class MPVController:
 
     def kill(self) -> None:
         """Beendet mpv sauber."""
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            time.sleep(1)
-        subprocess.run(["pkill", "-x", "mpv"], capture_output=True)
-        self.proc = None
-        log_event("mpv", "Beendet")
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                time.sleep(1)
+            subprocess.run(["pkill", "-x", "mpv"], capture_output=True)
+            self.proc = None
+            log_event("mpv", "Beendet")
 
     def send(self, command: list, timeout: int = 5):
         try:
@@ -192,9 +210,10 @@ class MPVController:
 
     def reload(self) -> None:
         """Lädt SEN-Stream in laufendem mpv neu (schneller als Neustart)."""
-        self._reset_watchdog()
-        self.send(["loadfile", SEN_STREAM, "replace"])
-        log_event("mpv", f"reload: {SEN_STREAM}")
+        with self.lock:
+            self._reset_watchdog()
+            self.send(["loadfile", SEN_STREAM, "replace"])
+            log_event("mpv", f"reload: {SEN_STREAM}")
 
     def screenshot(self, path: str) -> bool:
         """Aktuellen Video-Frame als PNG speichern."""
@@ -298,7 +317,7 @@ def setup_button(events: "queue.Queue") -> object:
     except ImportError:
         log_warn("taster", "gpiozero nicht installiert — Taster deaktiviert")
         return None
-    button = Button(CFG.button_gpio, pull_up=True, bounce_time=0.1)
+    button = Button(CFG.button_gpio, pull_up=True, bounce_time=0.05)
     # Zeitpunkt des Drucks mitgeben: die Sperrzeit gilt ab dem Druck, nicht ab der Verarbeitung
     button.when_pressed = lambda: events.put(time.time())
     log_event("taster", f"Taster an GPIO{CFG.button_gpio} bereit")
@@ -347,6 +366,114 @@ def is_frame_frozen(new_path: str, prev_path: str) -> bool:
     return diff < FROZEN_DIFF
 
 
+# ── Stream-Überwachung ────────────────────────────────────────────────────────
+
+class StreamMonitor(threading.Thread):
+    """Watchdog und Frozen-Frame-Erkennung in einem eigenen Thread.
+
+    Screenshots, Reload und mpv-Neustart dauern Sekunden. In der Hauptschleife
+    würden sie den Taster aufhalten. In „Aus“ läuft kein Stream, die Überwachung ruht.
+    """
+
+    def __init__(self, mpv: MPVController, views: kiosk.ViewController) -> None:
+        super().__init__(daemon=True, name="stream-monitor")
+        self.mpv, self.views = mpv, views
+        self.fatal = threading.Event()   # Level 3: Hauptschleife beendet das Skript
+        self.last_heartbeat = time.time()
+        self._reset(time.time())
+
+    def _reset(self, now: float) -> None:
+        self.last_watchdog  = now
+        self.last_badge     = now - BADGE_INTERVAL + 20  # ersten Check nach 20s
+        self.frozen_count   = 0
+        self.recovery_level = 0   # Eskalationsstufe (0=OK, 1=reload, 2=start, 3=Skript-Neustart)
+
+    def _recover(self, reload_only: bool = False) -> None:
+        wait_for_network(30)
+        with self.mpv.lock:
+            if self.views.view == "off":
+                return
+            if reload_only:
+                self.mpv.reload()
+            else:
+                self.mpv.start()
+
+    def run(self) -> None:
+        paused = True
+        while not self.fatal.is_set():
+            try:
+                now = time.time()
+                if self.views.view in (None, "off"):
+                    paused = True
+                elif paused:
+                    paused = False
+                    self._reset(now)
+                else:
+                    self._step(now)
+            except Exception as exc:  # noqa: BLE001 – Überwachung darf nie still sterben
+                log_error("monitor", f"{type(exc).__name__}: {exc}")
+                time.sleep(10)
+            time.sleep(1)
+
+    def _step(self, now: float) -> None:
+        if now - self.last_heartbeat >= LOG_HEARTBEAT:
+            self.last_heartbeat = now
+            log.info(
+                f"HEARTBEAT | Ansicht: {self.views.view} | mpv läuft: {self.mpv.is_running()} | "
+                f"Restarts: {self.mpv._restarts} | Frozen-Count: {self.frozen_count}"
+            )
+
+        if now - self.last_watchdog >= WATCHDOG_INTERVAL:
+            self.last_watchdog = now
+            if not self.mpv.is_running():
+                log_error("watchdog", "mpv-Prozess tot → Neustart")
+                self._recover()
+                self._reset(time.time())
+                return
+            if not self.mpv.is_playing():
+                log_warn("watchdog", "Kein Playback → Stream neu laden")
+                self._recover(reload_only=True)
+                self._reset(time.time())
+                return
+
+        if now - self.last_badge >= BADGE_INTERVAL:
+            self.last_badge = now
+            self._check_frame()
+
+    def _check_frame(self) -> None:
+        # mpv dekodiert auch verdeckt weiter, der Check läuft in beiden Ansichten
+        if not self.mpv.screenshot(SEN_SCREENSHOT):
+            log_warn("badge", "Screenshot fehlgeschlagen")
+            return
+        if is_frame_frozen(SEN_SCREENSHOT, SEN_PREV_SHOT):
+            self.frozen_count += 1
+            log_warn("frozen", f"Frame eingefroren ({self.frozen_count}/{FROZEN_LIMIT})")
+            if self.frozen_count >= FROZEN_LIMIT:
+                self.frozen_count    = 0
+                self.recovery_level += 1
+                if self.recovery_level == 1:
+                    log_warn("frozen", "Dauerhaft eingefroren → Stream neu laden (Level 1)")
+                    self._recover(reload_only=True)
+                elif self.recovery_level == 2:
+                    log_warn("frozen", "Reload hat nicht geholfen → mpv Neustart (Level 2)")
+                    self._recover()
+                else:
+                    log_error("frozen", "mpv Neustart hat nicht geholfen → "
+                                        f"Script-Neustart via systemd (Level {self.recovery_level})")
+                    self.fatal.set()
+                return
+        else:
+            if self.recovery_level > 0:
+                log_event("frozen", f"Stream wieder OK — Recovery-Level {self.recovery_level} → 0")
+            self.frozen_count   = 0
+            self.recovery_level = 0
+            try:
+                shutil.copy2(SEN_SCREENSHOT, SEN_PREV_SHOT)
+            except OSError:
+                pass
+        log_event("badge", f"SEN-Modus: {detect_badge(SEN_SCREENSHOT)}")
+
+
 # ── Hauptschleife ─────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -367,125 +494,47 @@ def main() -> None:
     display = Display(CFG)
     windows = kiosk.WlrctlWindows() if CFG.wayland else kiosk.NoWindows()
     browser = kiosk.Browser(CFG.dashboard_url)
-    views = kiosk.ViewController(CFG, display, windows, mpv, browser, log_event, time.time)
-    events: "queue.Queue[str]" = queue.Queue()
+    energy_browser = kiosk.Browser(CFG.energy_url, "energie-kiosk", "chromium-energie")
+    views = kiosk.ViewController(CFG, display, windows, mpv, browser, log_event, time.time,
+                                 energy_browser)
+    events: "queue.Queue[float]" = queue.Queue()
     button = setup_button(events)  # noqa: F841 – Referenz halten, sonst kein Callback
 
-    views.start()
+    views.start(kiosk.load_resume(time.time()))
+    monitor = StreamMonitor(mpv, views)
+    monitor.start()
 
-    last_watchdog   = time.time()
-    last_badge      = time.time() - BADGE_INTERVAL + 20  # ersten Check nach 20s
-    last_heartbeat  = time.time()
-    frozen_count    = 0
-    recovery_level  = 0   # Eskalationsstufe bei Frozen-Frame (0=OK, 1=reload, 2=start, 3=sys.exit)
-
-    def restart_mpv(reload_only: bool = False) -> None:
-        wait_for_network(30)
-        if reload_only:
-            mpv.reload()
-        else:
-            mpv.start()
-        views.refocus()  # neues mpv-Fenster nicht vor das Wetter legen
-
+    last_guard = time.time()
     while True:
         try:
             # ── Taster, Nachtmodus, automatischer Wechsel ─────────────────────
             while not events.empty():
                 pressed_at = events.get_nowait()
                 if not views.press(pressed_at):
-                    reason = "Stream lädt noch" if views.stream_loading() else "Preller"
+                    reason = "Stream lädt noch" if views.stream_loading() else "Preller oder laufender Wechsel"
                     log_event("taster", f"Druck ignoriert ({reason})")
-            previous_view = views.view
             views.tick()
-            if previous_view == "off" and views.view != "off":
-                frozen_count   = 0
-                recovery_level = 0
-                last_watchdog  = time.time()
-                last_badge     = time.time() + 20
 
             now = time.time()
 
-            # In „Aus“ läuft kein Stream: nur auf Taster und Tagesbeginn warten
-            if views.view == "off":
-                time.sleep(0.25)
-                continue
+            if monitor.fatal.is_set():
+                kiosk.save_resume(views.view)
+                sys.exit(1)   # systemd Restart=always startet Script neu
 
             # ── Browser am Leben halten ──────────────────────────────────────
-            if CFG.dashboard_url and not browser.is_running():
+            if views.view != "off" and CFG.dashboard_url and not browser.is_running():
                 log_warn("browser", "Chromium beendet → Neustart")
                 browser.start()
-                time.sleep(3)
-                views.refocus()
+            if views.view != "off" and CFG.energy_url and not energy_browser.is_running():
+                log_warn("browser", "Chromium Energie beendet → Neustart")
+                energy_browser.start()
 
-            # ── Stündlicher Heartbeat ────────────────────────────────────────
-            if now - last_heartbeat >= LOG_HEARTBEAT:
-                last_heartbeat = now
-                log.info(
-                    f"HEARTBEAT | Ansicht: {views.view} | mpv läuft: {mpv.is_running()} | "
-                    f"Restarts: {mpv._restarts} | Frozen-Count: {frozen_count}"
-                )
+            # ── Bildschirm zeigt, was die Ansicht sagt ────────────────────────
+            if now - last_guard >= GUARD_INTERVAL:
+                last_guard = now
+                views.guard()
 
-            # ── Watchdog ─────────────────────────────────────────────────────
-            if now - last_watchdog >= WATCHDOG_INTERVAL:
-                last_watchdog = now
-
-                if not mpv.is_running():
-                    log_error("watchdog", "mpv-Prozess tot → Neustart")
-                    restart_mpv()
-                    frozen_count   = 0
-                    recovery_level = 0
-                    continue
-
-                if not mpv.is_playing():
-                    log_warn("watchdog", "Kein Playback → Stream neu laden")
-                    restart_mpv(reload_only=True)
-                    frozen_count   = 0
-                    recovery_level = 0
-                    continue
-
-            # ── Badge + Frozen-Frame-Check ───────────────────────────────────
-            # mpv dekodiert auch verdeckt weiter, der Check läuft in beiden Ansichten
-            if now - last_badge >= BADGE_INTERVAL:
-                last_badge = now
-
-                if mpv.screenshot(SEN_SCREENSHOT):
-                    if is_frame_frozen(SEN_SCREENSHOT, SEN_PREV_SHOT):
-                        frozen_count += 1
-                        log_warn("frozen", f"Frame eingefroren ({frozen_count}/{FROZEN_LIMIT})")
-                        if frozen_count >= FROZEN_LIMIT:
-                            frozen_count    = 0
-                            recovery_level += 1
-                            if recovery_level == 1:
-                                log_warn("frozen",
-                                         "Dauerhaft eingefroren → Stream neu laden (Level 1)")
-                                restart_mpv(reload_only=True)
-                            elif recovery_level == 2:
-                                log_warn("frozen",
-                                         "Reload hat nicht geholfen → mpv Neustart (Level 2)")
-                                restart_mpv()
-                            else:
-                                log_error("frozen",
-                                          f"mpv Neustart hat nicht geholfen → "
-                                          f"Script-Neustart via systemd (Level {recovery_level})")
-                                sys.exit(1)   # systemd Restart=always startet Script neu
-                            continue
-                    else:
-                        if recovery_level > 0:
-                            log_event("frozen",
-                                      f"Stream wieder OK — Recovery-Level {recovery_level} → 0")
-                        frozen_count   = 0
-                        recovery_level = 0
-                        try:
-                            shutil.copy2(SEN_SCREENSHOT, SEN_PREV_SHOT)
-                        except OSError:
-                            pass
-
-                    badge = detect_badge(SEN_SCREENSHOT)
-                    log_event("badge", f"SEN-Modus: {badge}")
-                else:
-                    log_warn("badge", "Screenshot fehlgeschlagen")
-
-            time.sleep(0.25)
+            time.sleep(0.1)
 
         except KeyboardInterrupt:
             log.info("Beendet (Ctrl+C)")

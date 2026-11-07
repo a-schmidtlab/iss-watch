@@ -1,7 +1,7 @@
 # ISS Watch
 
 Raspberry Pi Kiosk für einen HDMI-Bildschirm mit drei Ansichten: **SEN 4K ISS-Live-Stream**,
-**Wetter-Dashboard** und **Aus**. Ein Taster schaltet zyklisch weiter, zwischen 01:00 und
+**Wetter-Dashboard** und **Aus**. Ein Taster schaltet um, zwischen 01:00 und
 06:00 Uhr geht der Bildschirm automatisch aus. Läuft seit November 2026 auf dem
 **wetterraspi5** (Raspberry Pi 5, Wayland/labwc) und hat den alten iss-Pi (Pi 3, X11) abgelöst.
 Derselbe Code läuft weiter unter X11, dann ohne Wetteransicht.
@@ -14,20 +14,28 @@ Derselbe Code läuft weiter unter X11, dann ohne Wetteransicht.
 |---------|------------|
 | ISS | mpv im Vollbild, Ton immer stumm |
 | Wetter | Chromium im Kiosk-Modus mit der lokalen Kiosk-Seite des Repos `wetterstation` |
-| Aus | HDMI aus, mpv beendet |
+| Aus | Monitor aus, mpv beendet |
 
 - **Start:** immer die Ansicht aus `start_view`, auf dem wetterraspi5 Wetter. Im Nachtmodus Aus.
 - **Taster** an **Pin 40 (GPIO21)** und **Pin 39 (GND)**, interner Pull-up, kein Widerstand nötig.
-  Pin 1–10 belegt am wetterraspi5 der NVMe-HAT. Jeder Druck schaltet ISS → Wetter → Aus → ISS.
-- **Prellen:** Ein Druck bis 500 ms nach dem letzten angenommenen Druck wird verworfen.
+  Pin 1–10 belegt am wetterraspi5 der NVMe-HAT.
+  - **Klick:** Wechsel zwischen ISS und Wetter. Er wirkt nach etwa 0,5 s, weil das Programm so
+    lange auf einen zweiten Klick wartet.
+  - **Doppelklick** (innerhalb 0,5 s): Monitor aus.
+  - **Klick bei Monitor aus:** sofort wieder an, zuletzt gezeigte Ansicht.
+- **Prellen:** Ein Druck bis 120 ms nach dem letzten Druck wird verworfen.
   Maßgeblich ist der Zeitpunkt des Drucks, nicht der Verarbeitung, denn ein Wechsel kann
   wegen des mpv-Starts Sekunden dauern.
 - **Stream lädt:** Solange der Stream in der Ansicht ISS noch nicht abspielt, nimmt der Taster
   nichts an, höchstens 30 s lang. Ohne Internet hängt man so nicht fest.
 - **Geschaltet wird nur von Hand.** Ein automatischer Wechsel ist möglich (`auto_cycle`),
   auf dem wetterraspi5 aber aus.
-- **Nachtmodus:** Um 01:00 auf Aus, um 06:00 zurück zur vorherigen Ansicht. Ein Tastendruck in
-  der Nacht hebt den Nachtmodus für diese Nacht auf, die gewählte Ansicht bleibt dann auch nach 06:00.
+- **Nachtmodus:** Um 01:00 auf Aus, um 06:00 zurück zur vorherigen Ansicht. War der Monitor von
+  Hand aus, geht er um 06:00 trotzdem an (Startansicht). Ein Tastendruck in der Nacht hebt den
+  Nachtmodus für diese Nacht auf, der gewählte Zustand bleibt dann auch nach 06:00.
+- **Wächter:** Jede Sekunde wird geprüft, ob das richtige Fenster vorn ist, alle 30 s, ob der
+  Monitor bei Aus wirklich aus ist. Startet sich das Skript nach einem Stream-Fehler neu, bleibt
+  die Ansicht erhalten.
 - mpv und Chromium laufen in beiden Ansichten nebeneinander, `wlrctl` holt das Fenster nach
   vorn. mpv dekodiert verdeckt weiter, deshalb schaltet es sofort um.
 
@@ -45,7 +53,11 @@ Alle 60 Sekunden wird ein Screenshot gemacht und ausgewertet:
 
 ### Nachtmodus (01:00–06:00 Uhr)
 
-Der HDMI-Ausgang wird abgeschaltet, mpv wird beendet: unter Wayland per `wlr-randr --output … --off`, beim Einschalten mit `--transform`, damit die Drehung des Bildschirms erhalten bleibt, unter X11 per `vcgencmd display_power`.
+Der Monitor wird ausgeschaltet, mpv wird beendet. Je nach `display_backend`:
+
+- `ddc` (wetterraspi5): Der Monitor geht per `ddcutil setvcp D6 4` in Standby, das HDMI-Signal bleibt an. Ohne Signal zeigt dieser Monitor einen blauen Bildschirm. Braucht `ddcutil`, das Modul `i2c-dev` und die Gruppe `i2c`. Der Bootparameter `video=HDMI-A-1:1920x1080@60D` verhindert, dass labwc den Ausgang wieder einschaltet.
+- `wlr-randr`: `--output … --off`, beim Einschalten mit `--transform`, damit die Drehung erhalten bleibt.
+- `vcgencmd` (X11): `vcgencmd display_power`.
 
 > **Warum `vcgencmd` unter X11?** Auf dem Raspberry Pi 3 B+ steht die DPMS-Extension (xset dpms) nicht zur Verfügung.
 
@@ -139,7 +151,7 @@ cat ~/.local/share/iss-watch-cookies.log
 
 **System-Pakete:**
 ```bash
-sudo apt install -y mpv python3-opencv python3-gpiozero python3-lgpio chromium wlrctl wlr-randr
+sudo apt install -y mpv python3-opencv python3-gpiozero python3-lgpio chromium wlrctl wlr-randr ddcutil
 ```
 
 **yt-dlp** im eigenen venv, die Debian-Version veraltet schnell:
@@ -239,7 +251,8 @@ python3 ~/iss/iss_watch.py
 | `auto_cycle`, `cycle` | `false` | automatischer Wechsel mit Dauern in Sekunden |
 | `button_gpio` | `0` | GPIO des Tasters, 0 = kein Taster |
 | `disable_wifi` | `true` | WLAN beim Start abschalten |
-| `display_backend` | `auto` | `auto`, `vcgencmd` oder `wlr-randr` |
+| `display_backend` | `auto` | `auto`, `vcgencmd`, `wlr-randr` oder `ddc` |
+| `ddc_bus` | `13` | I²C-Bus des Monitors, siehe `ddcutil detect` |
 | `output`, `output_transform` | `HDMI-A-1`, `normal` | Ausgang und Drehung (`180` am wetterraspi5) |
 | `sleep_start`, `sleep_end` | `1`, `6` | Nachtmodus |
 | `stream_url`, `cookies`, `ytdl_path` | SEN, Cookie-Pfad, leer | Stream und yt-dlp |

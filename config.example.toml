@@ -6,7 +6,9 @@
 
 # Wetter-Dashboard aus dem Repo wetterstation (Dienst wetter-web)
 dashboard_url = "http://127.0.0.1:8080/kiosk.html"
-start_view = "weather"            # iss | weather | off – nach jedem Start
+# Spreefeld Energie (dritte Ansicht, leer = keine)
+energy_url = "http://127.0.0.1:8080/energie-kiosk.html"
+start_view = "weather"            # iss | weather | energy | off – nach jedem Start
 
 # Automatischer Wechsel: aus, geschaltet wird nur mit dem Taster.
 # Zum Einschalten: auto_cycle = true, Dauern in Sekunden
@@ -14,14 +16,18 @@ auto_cycle = false
 cycle = [["iss", 60], ["weather", 30]]
 
 # Taster an GPIO21 (Pin 40) gegen GND (Pin 39), unterste Reihe der Stiftleiste.
-# Pin 1–10 sind am wetterraspi5 durch den NVMe-HAT belegt. ISS → Wetter → Aus → ISS
+# Pin 1–10 sind am wetterraspi5 durch den NVMe-HAT belegt.
+# Klick: ISS → Wetter → Energie → ISS, Doppelklick: Monitor aus, Klick in „Aus“: wieder an
 button_gpio = 21
 
 # WLAN ist hier die Reserve neben LAN und bleibt an
 disable_wifi = false
 
-# Bildschirm: um 180° gedreht (kanshi), muss beim Einschalten erhalten bleiben
-display_backend = "auto"          # auto | vcgencmd | wlr-randr
+# Bildschirm aus per DDC: Der Monitor geht in Standby, das HDMI-Signal bleibt an.
+# Ohne Signal zeigt er sonst einen blauen Bildschirm. Bus: ddcutil detect
+display_backend = "ddc"           # auto | vcgencmd | wlr-randr | ddc
+ddc_bus = 13
+# Nur für wlr-randr: um 180° gedreht (kanshi), muss beim Einschalten erhalten bleiben
 output = "HDMI-A-1"
 output_transform = "180"
 
