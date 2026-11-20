@@ -80,11 +80,12 @@ Wenn 4 aufeinanderfolgende Screenshots als eingefroren erkannt werden:
 
 Sobald wieder ein nicht-eingefrorener Frame erkannt wird, wird der Recovery-Level auf 0 zurückgesetzt.
 
-> **Bekannter Punkt (Stand 06.11.2026):** Auf der Nachtseite der Erde zeigt der Stream fast nur schwarz. Die Frame-Differenz fällt dann unter 1,5, obwohl das Bild nicht eingefroren ist: 280 von 1387 Messungen lagen unter der Schwelle. Das löst unnötige Reloads aus und kann bis zu Level 3 eskalieren, zuletzt am 05.11. um 11:00. Dabei startet das Skript neu und springt auf die Startansicht. Die Erkennung sollte künftig das Abspielen selbst prüfen oder Nachtbilder ausnehmen.
+> **Bekannter Punkt (Stand 06.11.2026):** Auf der Nachtseite der Erde zeigt der Stream fast nur schwarz. Die Frame-Differenz fällt dann unter 1,5, obwohl das Bild nicht eingefroren ist: 280 von 1387 Messungen lagen unter der Schwelle. Das löst unnötige Reloads aus und kann bis zu Level 3 eskalieren, zuletzt am 05.11. um 11:00. Dabei startet das Skript neu und springt auf die Startansicht. Die Erkennung sollte künftig das Abspielen selbst prüfen oder Nachtbilder ausnehmen. Vom 17. bis 19.11.2026 kam es viermal
+> tagsüber zu Level 3 bei Differenzen von 1,30 bis 1,45. Seit dem 20.11.2026 hält die Diagnose (unten) jeden Fall fest.
 
 ### WLAN
 
-Mit `disable_wifi = true` wird WLAN beim Start per `nmcli` und `rfkill` abgeschaltet, um Passwort-Popups zu verhindern (alter iss-Pi). Auf dem wetterraspi5 ist WLAN die Reserve neben LAN und bleibt an.
+Mit `disable_wifi = true` wird WLAN beim Start per `nmcli` und `rfkill` abgeschaltet, um Passwort-Popups zu verhindern (alter iss-Pi). Auf dem wetterraspi5 bleibt WLAN an, das automatische Verbinden mit dem Profil ULAM ist seit dem 20.11.2026 aus: Es kam am Aufstellort nie zustande und schrieb rund 2.600 Fehlversuche pro Woche ins Journal.
 
 ---
 
@@ -108,9 +109,23 @@ Protokolliert wird:
 - Frame-Differenz bei jedem Screenshot-Check
 - Badge-Farbe (live / replay / trailer / unknown)
 - Watchdog-Ereignisse (kein Fortschritt, Prozess tot)
-- Frozen-Frame-Eskalation (Level 1–3)
+- Frozen-Frame-Eskalation (Level 1–3), bei Level 3 mit den Differenzen, die zum Neustart führten
 - Netzwerkstatus
 - Stündlicher Heartbeat
+
+### Diagnose eingefrorener Bilder
+
+Jede Erkennung eines eingefrorenen Bildes legt unter `~/iss/diagnose/<Beginn des Vorfalls>/` ab:
+`L<Stufe>-<Zähler>-neu.jpg` und `-vorher.jpg` (die beiden verglichenen Frames, 960 px breit) und `L…json` mit
+Differenz, Helligkeit, Anteil dunkler Pixel, SEN-Badge, Ansicht und dem Zustand von mpv (`playback-time`, `core-idle`,
+`paused-for-cache`, `demuxer-cache-duration`, `estimated-vf-fps`, Frame-Drops, Titel). Die letzten 20 Vorfälle bleiben
+erhalten. Damit lässt sich unterscheiden:
+
+| Befund in der Diagnose | Bedeutung |
+|---|---|
+| `playback-time` steht, Puffer leer oder `paused-for-cache` | Stream hängt wirklich |
+| `playback-time` läuft weiter, Bilder sehen gleich aus, dunkel | Fehlalarm bei Nacht oder Standbild |
+| `playback-time` läuft, Bilder hell und verschieden genug fürs Auge | Schwelle 1,5 zu streng |
 
 **Live-Log:**
 ```bash

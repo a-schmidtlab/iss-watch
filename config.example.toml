@@ -20,7 +20,8 @@ cycle = [["iss", 60], ["weather", 30]]
 # Klick: ISS → Wetter → Energie → ISS, Doppelklick: Monitor aus, Klick in „Aus“: wieder an
 button_gpio = 21
 
-# WLAN ist hier die Reserve neben LAN und bleibt an
+# WLAN bleibt eingeschaltet. Das automatische Verbinden ist seit dem 20.11.2026 aus (nmcli, Profil ULAM):
+# Das WLAN kam am Aufstellort nie zustande und schrieb rund 2.600 Fehlversuche pro Woche ins Journal.
 disable_wifi = false
 
 # Bildschirm aus per DDC: Der Monitor geht in Standby, das HDMI-Signal bleibt an.

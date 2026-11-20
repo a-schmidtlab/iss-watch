@@ -122,7 +122,7 @@ class DdcDisplay:
         self.bus = str(bus)
 
     def _set(self, value: str) -> None:
-        subprocess.run(["ddcutil", "--bus", self.bus, "setvcp", "D6", value],
+        subprocess.run(["ddcutil", "--syslog", "NEVER", "--bus", self.bus, "setvcp", "D6", value],
                        capture_output=True, timeout=15)
 
     def on(self) -> None:
@@ -132,7 +132,8 @@ class DdcDisplay:
         self._set(self.STANDBY)
 
     def is_on(self) -> bool:
-        res = subprocess.run(["ddcutil", "--bus", self.bus, "getvcp", "D6"],
+        # --syslog NEVER: ddcutil schrieb sonst bei jedem Aufruf eine harmlose Warnung ins Journal (2.200 pro Woche)
+        res = subprocess.run(["ddcutil", "--syslog", "NEVER", "--bus", self.bus, "getvcp", "D6"],
                              capture_output=True, text=True, timeout=15)
         return "DPM: On" in res.stdout
 

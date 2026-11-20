@@ -51,6 +51,14 @@ LOG_MAX_BYTES    = 2 * 1024 * 1024   # 2 MB pro Datei
 LOG_BACKUP_COUNT = 7                  # max ~16 MB gesamt
 LOG_HEARTBEAT    = 60 * 60            # Stündlicher Status-Eintrag
 
+# Diagnose eingefrorener Bilder: Je Vorfall ein Ordner mit beiden Frames und dem Zustand von mpv, damit sich klären
+# lässt, ob das Bild wirklich stand (Stream hängt) oder die Erkennung falsch lag (dunkle Szene, Standbild im Stream)
+DIAG_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diagnose")
+DIAG_KEEP        = 20                 # so viele Vorfälle bleiben erhalten
+MPV_DIAG_PROPS   = ("playback-time", "time-pos", "core-idle", "paused-for-cache", "cache-buffering-state",
+                    "demuxer-cache-duration", "eof-reached", "estimated-vf-fps", "video-bitrate",
+                    "frame-drop-count", "decoder-frame-drop-count", "media-title")
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -353,17 +361,57 @@ def detect_badge(img_path: str) -> str:
     return "unknown"
 
 
-def is_frame_frozen(new_path: str, prev_path: str) -> bool:
-    """True wenn zwei aufeinanderfolgende Frames nahezu identisch sind."""
+def frame_stats(new_path: str, prev_path: str):
+    """Differenz und Helligkeit zweier aufeinanderfolgender Frames, None ohne Vergleich."""
     if not os.path.exists(prev_path):
-        return False
+        return None
     a = cv2.imread(new_path)
     b = cv2.imread(prev_path)
     if a is None or b is None or a.shape != b.shape:
+        return None
+    gray = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+    return {"diff": float(cv2.absdiff(a, b).mean()), "hell": float(gray.mean()),
+            "hell_vorher": float(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY).mean()),
+            "dunkel_anteil": float((gray < 16).mean()), "groesse": f"{a.shape[1]}x{a.shape[0]}"}
+
+
+def is_frame_frozen(new_path: str, prev_path: str) -> bool:
+    """True wenn zwei aufeinanderfolgende Frames nahezu identisch sind."""
+    stats = frame_stats(new_path, prev_path)
+    if stats is None:
         return False
-    diff = float(cv2.absdiff(a, b).mean())
-    log_event("frozen", f"Frame-Diff {diff:.2f} (Schwelle {FROZEN_DIFF})")
-    return diff < FROZEN_DIFF
+    log_event("frozen", f"Frame-Diff {stats['diff']:.2f} (Schwelle {FROZEN_DIFF}) | Helligkeit {stats['hell']:.0f} | "
+                        f"dunkel {100 * stats['dunkel_anteil']:.0f} %")
+    return stats["diff"] < FROZEN_DIFF
+
+
+def mpv_state(mpv) -> dict:
+    """Zustand von mpv für die Diagnose: Läuft die Zeit, puffert er, verliert er Frames?"""
+    state = {}
+    for prop in MPV_DIAG_PROPS:
+        res = mpv.send(["get_property", prop], timeout=1)
+        state[prop] = res.get("data") if res and res.get("error") == "success" else None
+    return state
+
+
+def save_diagnosis(incident: str, step: str, new_path: str, prev_path: str, info: dict) -> str:
+    """Legt Frames und Zustand eines Vorfalls ab. Alte Vorfälle fallen weg, damit der Ordner klein bleibt."""
+    folder = os.path.join(DIAG_DIR, incident)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        for name, path in ((f"{step}-neu.jpg", new_path), (f"{step}-vorher.jpg", prev_path)):
+            img = cv2.imread(path)
+            if img is not None:
+                scale = 960 / img.shape[1] if img.shape[1] > 960 else 1.0
+                img = cv2.resize(img, None, fx=scale, fy=scale) if scale < 1 else img
+                cv2.imwrite(os.path.join(folder, name), img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        with open(os.path.join(folder, f"{step}.json"), "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False, indent=1, default=str)
+        for old in sorted(os.listdir(DIAG_DIR))[:-DIAG_KEEP]:
+            shutil.rmtree(os.path.join(DIAG_DIR, old), ignore_errors=True)
+    except OSError as exc:
+        log_warn("diagnose", f"nicht gespeichert: {exc}")
+    return folder
 
 
 # ── Stream-Überwachung ────────────────────────────────────────────────────────
@@ -387,6 +435,8 @@ class StreamMonitor(threading.Thread):
         self.last_badge     = now - BADGE_INTERVAL + 20  # ersten Check nach 20s
         self.frozen_count   = 0
         self.recovery_level = 0   # Eskalationsstufe (0=OK, 1=reload, 2=start, 3=Skript-Neustart)
+        self.incident       = None  # Ordner der laufenden Diagnose
+        self.diffs          = []    # Frame-Differenzen des laufenden Vorfalls
 
     def _recover(self, reload_only: bool = False) -> None:
         wait_for_network(30)
@@ -440,6 +490,22 @@ class StreamMonitor(threading.Thread):
             self.last_badge = now
             self._check_frame()
 
+    def _diagnose(self) -> None:
+        """Hält jede Erkennung eines eingefrorenen Bildes fest: beide Frames, Helligkeit, Zustand von mpv, Ansicht."""
+        stats = frame_stats(SEN_SCREENSHOT, SEN_PREV_SHOT) or {}
+        state = mpv_state(self.mpv)
+        self.diffs.append(stats.get("diff", -1))
+        if self.incident is None:
+            self.incident = time.strftime("%Y%m%d-%H%M%S")
+        step = f"L{self.recovery_level}-{self.frozen_count}"
+        info = {"zeit": time.strftime("%F %T"), "stufe": self.recovery_level, "zaehler": self.frozen_count,
+                "ansicht": self.views.view, "bild": stats, "badge": detect_badge(SEN_SCREENSHOT), "mpv": state,
+                "mpv_neustarts": self.mpv._restarts}
+        folder = save_diagnosis(self.incident, step, SEN_SCREENSHOT, SEN_PREV_SHOT, info)
+        log_event("diagnose", f"{step}: Zeit {state.get('playback-time')} | Leerlauf {state.get('core-idle')} | "
+                              f"Puffer {state.get('demuxer-cache-duration')} s | puffert {state.get('paused-for-cache')} | "
+                              f"fps {state.get('estimated-vf-fps')} | Drops {state.get('frame-drop-count')} → {folder}")
+
     def _check_frame(self) -> None:
         # mpv dekodiert auch verdeckt weiter, der Check läuft in beiden Ansichten
         if not self.mpv.screenshot(SEN_SCREENSHOT):
@@ -448,6 +514,7 @@ class StreamMonitor(threading.Thread):
         if is_frame_frozen(SEN_SCREENSHOT, SEN_PREV_SHOT):
             self.frozen_count += 1
             log_warn("frozen", f"Frame eingefroren ({self.frozen_count}/{FROZEN_LIMIT})")
+            self._diagnose()
             if self.frozen_count >= FROZEN_LIMIT:
                 self.frozen_count    = 0
                 self.recovery_level += 1
@@ -460,13 +527,18 @@ class StreamMonitor(threading.Thread):
                 else:
                     log_error("frozen", "mpv Neustart hat nicht geholfen → "
                                         f"Script-Neustart via systemd (Level {self.recovery_level})")
+                    log_error("frozen", f"Grund für den Neustart: Frame-Differenzen {', '.join(f'{d:.2f}' for d in self.diffs)} "
+                                        f"unter der Schwelle {FROZEN_DIFF}, Diagnose in {self.incident}")
                     self.fatal.set()
                 return
         else:
             if self.recovery_level > 0:
                 log_event("frozen", f"Stream wieder OK — Recovery-Level {self.recovery_level} → 0")
+            if self.incident:
+                log_event("diagnose", f"Vorfall beendet ohne Neustart: {self.incident}")
             self.frozen_count   = 0
             self.recovery_level = 0
+            self.incident, self.diffs = None, []
             try:
                 shutil.copy2(SEN_SCREENSHOT, SEN_PREV_SHOT)
             except OSError:
