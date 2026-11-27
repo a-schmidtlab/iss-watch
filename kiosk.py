@@ -14,7 +14,7 @@ import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
 
-VIEWS = ("iss", "weather", "energy", "off")
+VIEWS = ("iss", "weather", "haus", "energy", "off")
 CONFIG_PATH = os.path.expanduser("~/.config/iss-watch/config.toml")
 # Ansicht über einen Skript-Neustart retten. Liegt im flüchtigen Laufzeitordner:
 # Nach einem Neustart des Pi gilt wieder start_view.
@@ -37,7 +37,8 @@ class Config:
     sleep_start: int = 1
     sleep_end: int = 6
     dashboard_url: str = ""                  # leer = keine Wetteransicht
-    energy_url: str = ""                     # leer = keine Energieansicht
+    energy_url: str = ""                     # leer = keine Energieansicht (Spreefeld)
+    haus_url: str = ""                       # leer = keine Ansicht Silke & Axel Energie
     start_view: str = "iss"
     auto_cycle: bool = False
     cycle: list = field(default_factory=lambda: [["iss", 60], ["weather", 30]])
@@ -141,7 +142,7 @@ class DdcDisplay:
 class WlrctlWindows:
     """Holt ein Fenster per App-ID nach vorn (wlr-foreign-toplevel)."""
 
-    APP_IDS = {"iss": "iss-mpv", "weather": "wetter-kiosk", "energy": "energie-kiosk"}
+    APP_IDS = {"iss": "iss-mpv", "weather": "wetter-kiosk", "haus": "haus-kiosk", "energy": "energie-kiosk"}
 
     def focus(self, view: str) -> bool:
         res = subprocess.run(["wlrctl", "toplevel", "focus", f"app_id:{self.APP_IDS[view]}"],
@@ -222,7 +223,7 @@ class ViewController:
     OFF_CHECK = 30    # Sekunden zwischen Prüfungen in „Aus“ (DDC ist langsam)
 
     def __init__(self, cfg: Config, display, windows, mpv, browser, log_event, now,
-                 energy_browser=None) -> None:
+                 energy_browser=None, haus_browser=None) -> None:
         self.cfg, self.display, self.windows = cfg, display, windows
         self.mpv, self.browser, self.log_event, self.now = mpv, browser, log_event, now
         self.view = None
@@ -238,6 +239,8 @@ class ViewController:
         self.has_weather = bool(cfg.dashboard_url)
         self.energy_browser = energy_browser
         self.has_energy = bool(cfg.energy_url and energy_browser)
+        self.haus_browser = haus_browser
+        self.has_haus = bool(cfg.haus_url and haus_browser)
 
     # Hilfen
     def _durations(self) -> dict:
@@ -257,6 +260,8 @@ class ViewController:
     def set_view(self, view: str, reason: str) -> None:
         if view == "energy" and not self.has_energy:
             view = "weather"
+        if view == "haus" and not self.has_haus:
+            view = "weather"
         if view == "weather" and not self.has_weather:
             view = "iss"
         if view == self.view:
@@ -274,6 +279,8 @@ class ViewController:
                 self.browser.start()
             if self.has_energy and not self.energy_browser.is_running():
                 self.energy_browser.start()
+            if self.has_haus and not self.haus_browser.is_running():
+                self.haus_browser.start()
             if not self.mpv.is_running():
                 self.mpv.start()
             self.windows.focus(view)
@@ -323,7 +330,8 @@ class ViewController:
         if self.pending_click is None or self.now() - self.pending_click <= self.DOUBLE_CLICK:
             return
         self.pending_click = None
-        order = ["iss", "weather"] + (["energy"] if self.has_energy else [])
+        # Silke & Axel Energie kommt direkt nach dem Wetter (Wunsch Axel, 27.11.2026)
+        order = ["iss", "weather"] + (["haus"] if self.has_haus else []) + (["energy"] if self.has_energy else [])
         following = order[(order.index(self.view) + 1) % len(order)] if self.view in order else "weather"
         self.set_view(following, "Klick")
 

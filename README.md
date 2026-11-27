@@ -1,7 +1,7 @@
 # ISS Watch
 
-Raspberry Pi Kiosk für einen HDMI-Bildschirm mit drei Ansichten: **SEN 4K ISS-Live-Stream**,
-**Wetter-Dashboard** und **Aus**. Ein Taster schaltet um, zwischen 01:00 und
+Raspberry Pi Kiosk für einen HDMI-Bildschirm mit den Ansichten **SEN 4K ISS-Live-Stream**,
+**Wetter-Dashboard**, **Silke & Axel Energie** (Balkonsolar mit Solarbank), **Spreefeld Energie** und **Aus**. Ein Taster schaltet um, zwischen 01:00 und
 06:00 Uhr geht der Bildschirm automatisch aus. Läuft seit November 2026 auf dem
 **wetterraspi5** (Raspberry Pi 5, Wayland/labwc) und hat den alten iss-Pi (Pi 3, X11) abgelöst.
 Derselbe Code läuft weiter unter X11, dann ohne Wetteransicht.
@@ -14,12 +14,15 @@ Derselbe Code läuft weiter unter X11, dann ohne Wetteransicht.
 |---------|------------|
 | ISS | mpv im Vollbild, Ton immer stumm |
 | Wetter | Chromium im Kiosk-Modus mit der lokalen Kiosk-Seite des Repos `wetterstation` |
+| Silke & Axel Energie | eigenes Chromium-Fenster mit `haus-kiosk.html` aus `wetterstation` (nur mit `haus_url`) |
+| Spreefeld Energie | eigenes Chromium-Fenster mit `energie-kiosk.html` aus `wetterstation` (nur mit `energy_url`) |
 | Aus | Monitor aus, mpv beendet |
 
 - **Start:** immer die Ansicht aus `start_view`, auf dem wetterraspi5 Wetter. Im Nachtmodus Aus.
 - **Taster** an **Pin 40 (GPIO21)** und **Pin 39 (GND)**, interner Pull-up, kein Widerstand nötig.
   Pin 1–10 belegt am wetterraspi5 der NVMe-HAT.
-  - **Klick:** Wechsel zwischen ISS und Wetter. Er wirkt nach etwa 0,5 s, weil das Programm so
+  - **Klick:** nächste Ansicht in der Folge ISS, Wetter, Silke & Axel Energie, Spreefeld Energie
+    (nicht eingerichtete Ansichten entfallen). Er wirkt nach etwa 0,5 s, weil das Programm so
     lange auf einen zweiten Klick wartet.
   - **Doppelklick** (innerhalb 0,5 s): Monitor aus.
   - **Klick bei Monitor aus:** sofort wieder an, zuletzt gezeigte Ansicht.
@@ -262,7 +265,9 @@ python3 ~/iss/iss_watch.py
 | Option | Standard | Beschreibung |
 |--------|----------|--------------|
 | `dashboard_url` | leer | Wetter-Dashboard; leer = keine Wetteransicht |
-| `start_view` | `iss` | Ansicht nach jedem Start: `iss`, `weather` oder `off` |
+| `haus_url` | leer | Silke & Axel Energie; leer = keine Ansicht |
+| `energy_url` | leer | Spreefeld Energie; leer = keine Ansicht |
+| `start_view` | `iss` | Ansicht nach jedem Start: `iss`, `weather`, `haus`, `energy` oder `off` |
 | `auto_cycle`, `cycle` | `false` | automatischer Wechsel mit Dauern in Sekunden |
 | `button_gpio` | `0` | GPIO des Tasters, 0 = kein Taster |
 | `disable_wifi` | `true` | WLAN beim Start abschalten |

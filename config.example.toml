@@ -8,7 +8,9 @@
 dashboard_url = "http://127.0.0.1:8080/kiosk.html"
 # Spreefeld Energie (dritte Ansicht, leer = keine)
 energy_url = "http://127.0.0.1:8080/energie-kiosk.html"
-start_view = "weather"            # iss | weather | energy | off – nach jedem Start
+# Silke & Axel Energie (Balkonsolar mit Solarbank), kommt beim Klicken direkt nach dem Wetter
+haus_url = "http://127.0.0.1:8080/haus-kiosk.html"
+start_view = "weather"            # iss | weather | haus | energy | off – nach jedem Start
 
 # Automatischer Wechsel: aus, geschaltet wird nur mit dem Taster.
 # Zum Einschalten: auto_cycle = true, Dauern in Sekunden

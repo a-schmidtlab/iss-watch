@@ -45,7 +45,7 @@ def make(hour=12, auto_cycle=True, **cfg):
     clock, display, windows, mpv, browser = Clock(hour), Fake(), Fake(), Fake(), Fake()
     events = []
     vc = kiosk.ViewController(config, display, windows, mpv, browser,
-                              lambda cat, msg: events.append(msg), clock, Fake())
+                              lambda cat, msg: events.append(msg), clock, Fake(), Fake())
     return vc, clock, display, windows, mpv, browser
 
 
@@ -405,3 +405,27 @@ def test_resume_accepts_energy(tmp_path):
     path = tmp_path / "resume"
     path.write_text("energy", encoding="utf-8")
     assert kiosk.load_resume(os.path.getmtime(path), str(path)) == "energy"
+
+
+HAUS = "http://127.0.0.1:8080/haus-kiosk.html"
+
+
+def test_click_cycles_through_four_views_with_haus_after_weather():
+    vc, clock, display, windows, mpv, browser = make(auto_cycle=False, energy_url=ENERGY, haus_url=HAUS)
+    vc.start()
+    assert vc.haus_browser.running and vc.energy_browser.running
+    seen = []
+    for _ in range(4):
+        click(vc, clock)
+        seen.append(vc.view)
+        mpv.ready = True
+        windows.calls.clear()
+    assert seen == ["haus", "energy", "iss", "weather"]
+
+
+def test_haus_view_without_url_falls_back():
+    vc, clock, *_ = make(auto_cycle=False)
+    vc.start()
+    vc.set_view("haus", "Test")
+    assert vc.view == "weather"
+

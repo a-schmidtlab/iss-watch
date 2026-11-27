@@ -567,8 +567,9 @@ def main() -> None:
     windows = kiosk.WlrctlWindows() if CFG.wayland else kiosk.NoWindows()
     browser = kiosk.Browser(CFG.dashboard_url)
     energy_browser = kiosk.Browser(CFG.energy_url, "energie-kiosk", "chromium-energie")
+    haus_browser = kiosk.Browser(CFG.haus_url, "haus-kiosk", "chromium-haus")
     views = kiosk.ViewController(CFG, display, windows, mpv, browser, log_event, time.time,
-                                 energy_browser)
+                                 energy_browser, haus_browser)
     events: "queue.Queue[float]" = queue.Queue()
     button = setup_button(events)  # noqa: F841 – Referenz halten, sonst kein Callback
 
@@ -600,6 +601,9 @@ def main() -> None:
             if views.view != "off" and CFG.energy_url and not energy_browser.is_running():
                 log_warn("browser", "Chromium Energie beendet → Neustart")
                 energy_browser.start()
+            if views.view != "off" and CFG.haus_url and not haus_browser.is_running():
+                log_warn("browser", "Chromium Silke & Axel Energie beendet → Neustart")
+                haus_browser.start()
 
             # ── Bildschirm zeigt, was die Ansicht sagt ────────────────────────
             if now - last_guard >= GUARD_INTERVAL:
